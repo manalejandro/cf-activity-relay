@@ -1,6 +1,8 @@
 /**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
+ * cf-activity-relay — Cloudflare Worker configuration.
+ *
+ * Bindings are documented in the README. Secrets (`ADMIN_TOKEN`, optional
+ * `RELAY_PRIVATE_KEY_PEM`) are managed with `wrangler secret put`.
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
@@ -10,33 +12,79 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
 	/**
-	 * Smart Placement
-	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+	 * Smart Placement runs the relay near its D1 primary database. All relay
+	 * traffic is server-to-server federation traffic, so this reduces the
+	 * latency of the many D1 reads and writes per request.
 	 */
-	// "placement": {  "mode": "smart" }
+	"placement": { "mode": "smart" },
 	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+	 * The canonical identity is the custom domain below. Disable the
+	 * `workers.dev` hostname so federation metadata cannot diverge.
 	 */
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": {  "directory": "./public/",  "binding": "ASSETS" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
+	"workers_dev": false,
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS"
+	},
+	"vars": {
+		"RELAY_DOMAIN": "relay.manalejandro.com",
+		"RELAY_SERVICENAME": "manalejandro Relay",
+		"RELAY_SUMMARY": "A public ActivityPub relay for the fediverse, running on Cloudflare Workers.",
+		"RELAY_ICON": "https://relay.manalejandro.com/logo.png",
+		"RELAY_IMAGE": "https://relay.manalejandro.com/banner.png",
+		"PUBLIC_ADDRESS_DISTRIBUTION_POLICY": "explicit_public_only",
+		"OUTBOUND_SIGNATURE_PROFILE": "dual",
+		"PERSON_ONLY": "false",
+		"MANUALLY_ACCEPT": "false",
+		"MAX_ACTIVITY_BYTES": "1048576",
+		"MAX_FANOUT_TARGETS": "5000",
+		"MAX_QUEUE_JOBS": "100000"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "cf-activity-relay-db",
+			"database_id": "c1f0d8aa-8d65-4921-963b-ed1335d86731"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "CACHE",
+			"id": "e1b8b7447b34423288bbac26f78f2b16"
+		}
+	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "DELIVERY_QUEUE",
+				"queue": "cf-activity-relay-delivery"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "cf-activity-relay-delivery",
+				"max_batch_size": 25,
+				"max_batch_timeout": 5,
+				"max_retries": 5,
+				"max_concurrency": 10,
+				"dead_letter_queue": "cf-activity-relay-delivery-dlq"
+			},
+			{
+				"queue": "cf-activity-relay-delivery-dlq",
+				"max_batch_size": 25,
+				"max_retries": 0
+			}
+		]
+	},
+	"routes": [
+		{
+			"pattern": "relay.manalejandro.com",
+			"custom_domain": true
+		}
+	],
+	"triggers": {
+		"crons": ["17 * * * *"]
+	}
 }

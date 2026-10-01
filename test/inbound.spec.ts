@@ -1,0 +1,154 @@
+import { SELF, env } from 'cloudflare:test';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { generateRsaKeyPair } from '../src/crypto/keys';
+import { signLegacyRequest } from '../src/crypto/legacy';
+import { signRfc9421Request } from '../src/crypto/rfc9421';
+
+const RELAY = 'https://relay.manalejandro.com';
+const REMOTE_ACTOR = 'https://remote.example/actor';
+const REMOTE_KEY = `${REMOTE_ACTOR}#main-key`;
+const REMOTE_INBOX = 'https://remote.example/inbox';
+const PUBLIC_ADDRESS = 'https://www.w3.org/ns/activitystreams#Public';
+
+let privateKeyPem = '';
+let publicKeyPem = '';
+
+/** Intercepts every outbound federation request the worker makes. */
+function stubFederation(): ReturnType<typeof vi.fn> {
+	const mock = vi.fn(async (input: RequestInfo | URL) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+		if (url === REMOTE_ACTOR) {
+			return new Response(
+				JSON.stringify({
+					'@context': 'https://www.w3.org/ns/activitystreams',
+					id: REMOTE_ACTOR,
+					type: 'Application',
+					inbox: REMOTE_INBOX,
+					endpoints: { sharedInbox: REMOTE_INBOX },
+					publicKey: { id: REMOTE_KEY, owner: REMOTE_ACTOR, publicKeyPem },
+				}),
+				{ headers: { 'Content-Type': 'application/activity+json' } },
+			);
+		}
+		if (url === REMOTE_INBOX) return new Response('', { status: 202 });
+		return new Response('not found', { status: 404 });
+	});
+	vi.stubGlobal('fetch', mock);
+	return mock;
+}
+
+function followActivity(id: string): string {
+	return JSON.stringify({
+		'@context': 'https://www.w3.org/ns/activitystreams',
+		id,
+		type: 'Follow',
+		actor: REMOTE_ACTOR,
+		object: PUBLIC_ADDRESS,
+	});
+}
+
+beforeAll(async () => {
+	const pair = await generateRsaKeyPair(2048);
+	privateKeyPem = pair.privateKeyPem;
+	publicKeyPem = pair.publicKeyPem;
+});
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+});
+
+describe('inbound inbox processing', () => {
+	it('accepts a legacy-signed Follow and records the subscriber', async () => {
+		stubFederation();
+		const body = followActivity('https://remote.example/activities/follow-legacy');
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		const row = await env.DB.prepare('SELECT * FROM subscribers WHERE domain = ?').bind('remote.example').first<{ inbox_url: string; actor_id: string }>();
+		expect(row?.inbox_url).toBe(REMOTE_INBOX);
+		expect(row?.actor_id).toBe(REMOTE_ACTOR);
+	});
+
+	it('accepts an RFC 9421 signed Follow', async () => {
+		stubFederation();
+		const body = followActivity('https://remote.example/activities/follow-rfc9421');
+		const signed = await signRfc9421Request({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+	});
+
+	it('rejects an unsigned activity', async () => {
+		stubFederation();
+		const response = await SELF.fetch(`${RELAY}/inbox`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/activity+json' },
+			body: followActivity('https://remote.example/activities/unsigned'),
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it('rejects a tampered legacy signature', async () => {
+		stubFederation();
+		const body = followActivity('https://remote.example/activities/tampered');
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const tampered = JSON.stringify({ ...JSON.parse(body), object: 'https://relay.manalejandro.com/actor' });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body: tampered });
+		expect(response.status).toBe(400);
+	});
+
+	it('does not fan out an activity that is only public in cc', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/unlisted',
+			type: 'Create',
+			actor: REMOTE_ACTOR,
+			to: ['https://remote.example/actor/followers'],
+			cc: [PUBLIC_ADDRESS],
+			object: { id: 'https://remote.example/notes/1', type: 'Note' },
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		// The publisher is accounted for, but the unlisted activity was never
+		// wrapped into a relay Announce payload.
+		const publisher = await env.DB.prepare('SELECT * FROM publishers WHERE domain = ?').bind('remote.example').first();
+		expect(publisher).toBeTruthy();
+		const payload = await env.DB.prepare('SELECT COUNT(*) AS total FROM activity_payloads WHERE body LIKE ?')
+			.bind('%https://remote.example/notes/1%')
+			.first<{ total: number }>();
+		expect(payload?.total).toBe(0);
+	});
+
+	it('fans a public Create out to registered receivers', async () => {
+		stubFederation();
+		await env.DB.prepare(
+			`INSERT INTO subscribers (domain, inbox_url, activity_id, actor_id, created_at) VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(domain) DO NOTHING`,
+		)
+			.bind('receiver.example', 'https://receiver.example/inbox', 'https://receiver.example/activities/follow', 'https://receiver.example/actor', new Date().toISOString())
+			.run();
+
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/create-1',
+			type: 'Create',
+			actor: REMOTE_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: { id: 'https://remote.example/notes/2', type: 'Note', content: 'hello' },
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		const payload = await env.DB.prepare('SELECT body, remain_count FROM activity_payloads ORDER BY created_at DESC LIMIT 1').first<{ body: string; remain_count: number }>();
+		expect(payload).toBeTruthy();
+		expect(payload?.remain_count).toBe(1);
+		const announce = JSON.parse(payload?.body ?? '{}') as Record<string, unknown>;
+		expect(announce.type).toBe('Announce');
+		expect(announce.actor).toBe(`${RELAY}/actor`);
+		expect(announce.object).toBe('https://remote.example/notes/2');
+	});
+});

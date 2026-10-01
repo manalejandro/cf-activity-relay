@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 500" width="1500" height="500" role="img" aria-label="cf-activity-relay banner">
+	<defs>
+		<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="#12102b"/>
+			<stop offset="0.55" stop-color="#312e81"/>
+			<stop offset="1" stop-color="#0e7490"/>
+		</linearGradient>
+		<radialGradient id="glow" cx="0.18" cy="0.5" r="0.6">
+			<stop offset="0" stop-color="#22d3ee" stop-opacity="0.32"/>
+			<stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+		</radialGradient>
+		<linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="#4338ca"/>
+			<stop offset="1" stop-color="#0891b2"/>
+		</linearGradient>
+	</defs>
+	<rect width="1500" height="500" fill="url(#bg)"/>
+	<rect width="1500" height="500" fill="url(#glow)"/>
+	<g stroke="#ffffff" stroke-opacity="0.08" stroke-width="3" fill="none">
+		<circle cx="1330" cy="90" r="150"/>
+		<circle cx="1420" cy="430" r="210"/>
+		<circle cx="1180" cy="330" r="90"/>
+	</g>
+	<g transform="translate(84, 66)">
+		<rect width="368" height="368" rx="84" fill="url(#mark)"/>
+		<circle cx="184" cy="184" r="124" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="4"/>
+		<g stroke="#ffffff" stroke-opacity="0.85" stroke-width="9" stroke-linecap="round">
+			<line x1="184" y1="184" x2="184" y2="76"/>
+			<line x1="184" y1="184" x2="278" y2="130"/>
+			<line x1="184" y1="184" x2="278" y2="238"/>
+			<line x1="184" y1="184" x2="184" y2="292"/>
+			<line x1="184" y1="184" x2="90" y2="238"/>
+			<line x1="184" y1="184" x2="90" y2="130"/>
+		</g>
+		<g fill="#ffffff">
+			<circle cx="278" cy="130" r="18"/>
+			<circle cx="278" cy="238" r="18"/>
+			<circle cx="184" cy="292" r="18"/>
+			<circle cx="90" cy="238" r="18"/>
+			<circle cx="90" cy="130" r="18"/>
+		</g>
+		<circle cx="184" cy="76" r="22" fill="#67e8f9"/>
+		<circle cx="184" cy="76" r="9" fill="#0e7490"/>
+		<circle cx="184" cy="184" r="42" fill="#e0f2fe"/>
+		<circle cx="184" cy="184" r="19" fill="#312e81"/>
+	</g>
+	<text x="512" y="208" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="82" font-weight="bold" fill="#ffffff">cf-activity-relay</text>
+	<text x="516" y="278" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="34" fill="#a5b4fc">A public ActivityPub relay running on Cloudflare Workers</text>
+	<text x="516" y="344" font-family="DejaVu Sans Mono, Consolas, monospace" font-size="30" fill="#67e8f9">relay.manalejandro.com</text>
+	<g transform="translate(516, 382)">
+		<rect width="176" height="44" rx="22" fill="#ffffff" fill-opacity="0.10" stroke="#ffffff" stroke-opacity="0.24"/>
+		<text x="88" y="30" text-anchor="middle" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="22" fill="#e0e7ff">MIT licensed</text>
+	</g>
+</svg>

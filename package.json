@@ -1,19 +1,29 @@
 {
-  "name": "cf-activity-relay",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "start": "wrangler dev",
-    "test": "vitest",
-    "cf-typegen": "wrangler types"
-  },
-  "devDependencies": {
-    "@cloudflare/vitest-plugin": "^1.0.0",
-    "@types/node": "^26.6.3",
-    "typescript": "^5.5.2",
-    "vitest": "~4.1.0",
-    "wrangler": "^4.145.0"
-  }
+	"name": "cf-activity-relay",
+	"version": "1.0.0",
+	"description": "An ActivityPub relay for Cloudflare Workers: signed federation, fan-out delivery, and a public status endpoint.",
+	"private": true,
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/manalejandro/cf-activity-relay.git"
+	},
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"typecheck": "tsc --noEmit",
+		"cf-typegen": "wrangler types",
+		"db:migrate": "wrangler d1 execute cf-activity-relay-db --remote --file=src/db/schema.sql",
+		"db:migrate:local": "wrangler d1 execute cf-activity-relay-db --local --file=src/db/schema.sql"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-plugin": "^1.0.0",
+		"@types/node": "^26.6.3",
+		"typescript": "^5.5.2",
+		"vitest": "~4.1.0",
+		"wrangler": "^4.145.0"
+	}
 }

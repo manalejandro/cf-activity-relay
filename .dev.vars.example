@@ -1,0 +1,5 @@
+# Local development secrets for `wrangler dev`.
+# Copy to `.dev.vars` and adjust. Never commit `.dev.vars`.
+ADMIN_TOKEN=dev-token
+# Optional: externally managed relay RSA private key (PKCS#8 or PKCS#1 PEM).
+# RELAY_PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----\n..."

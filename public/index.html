@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>cf-activity-relay — ActivityPub relay</title>
+		<meta name="description" content="A public ActivityPub relay for the fediverse, running on Cloudflare Workers." />
+		<link rel="icon" href="/logo.svg" type="image/svg+xml" />
+		<meta property="og:title" content="cf-activity-relay" />
+		<meta property="og:description" content="A public ActivityPub relay for the fediverse, running on Cloudflare Workers." />
+		<meta property="og:image" content="/banner.png" />
+		<style>
+			:root {
+				--bg: #0b0a1c;
+				--panel: #15142c;
+				--panel-2: #1c1b38;
+				--border: #2c2a52;
+				--text: #eef2ff;
+				--muted: #a5a8c7;
+				--accent: #67e8f9;
+				--accent-2: #a5b4fc;
+				--ok: #4ade80;
+			}
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				background:
+					radial-gradient(1100px 500px at 15% -10%, rgba(67, 56, 202, 0.45), transparent 60%),
+					radial-gradient(900px 500px at 90% 0%, rgba(8, 145, 178, 0.35), transparent 55%), var(--bg);
+				color: var(--text);
+				font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+				line-height: 1.6;
+				min-height: 100vh;
+			}
+			.wrap {
+				max-width: 980px;
+				margin: 0 auto;
+				padding: 40px 24px 72px;
+			}
+			header {
+				display: flex;
+				align-items: center;
+				gap: 18px;
+				flex-wrap: wrap;
+			}
+			header img {
+				width: 64px;
+				height: 64px;
+				border-radius: 16px;
+				box-shadow: 0 12px 40px rgba(34, 211, 238, 0.25);
+			}
+			header h1 {
+				margin: 0;
+				font-size: clamp(1.5rem, 4vw, 2.1rem);
+				letter-spacing: -0.02em;
+			}
+			header p {
+				margin: 2px 0 0;
+				color: var(--muted);
+			}
+			.badge {
+				display: inline-flex;
+				align-items: center;
+				gap: 8px;
+				background: rgba(74, 222, 128, 0.12);
+				border: 1px solid rgba(74, 222, 128, 0.35);
+				color: var(--ok);
+				border-radius: 999px;
+				padding: 6px 14px;
+				font-size: 0.85rem;
+				font-weight: 600;
+				margin-left: auto;
+			}
+			.dot {
+				width: 8px;
+				height: 8px;
+				border-radius: 50%;
+				background: currentColor;
+			}
+			.hero {
+				margin-top: 42px;
+				background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+				border: 1px solid var(--border);
+				border-radius: 24px;
+				padding: 32px;
+			}
+			.hero h2 {
+				margin: 0 0 8px;
+				font-size: clamp(1.6rem, 5vw, 2.4rem);
+				letter-spacing: -0.03em;
+			}
+			.hero p {
+				margin: 0;
+				color: var(--muted);
+				max-width: 62ch;
+			}
+			.stats {
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+				gap: 16px;
+				margin-top: 26px;
+			}
+			.stat {
+				background: var(--panel);
+				border: 1px solid var(--border);
+				border-radius: 18px;
+				padding: 18px 20px;
+			}
+			.stat span {
+				display: block;
+				color: var(--muted);
+				font-size: 0.82rem;
+				text-transform: uppercase;
+				letter-spacing: 0.08em;
+			}
+			.stat strong {
+				display: block;
+				font-size: 1.9rem;
+				letter-spacing: -0.02em;
+				margin-top: 4px;
+			}
+			.stat small {
+				color: var(--accent-2);
+			}
+			.grid {
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+				gap: 20px;
+				margin-top: 24px;
+			}
+			.card {
+				background: var(--panel);
+				border: 1px solid var(--border);
+				border-radius: 20px;
+				padding: 26px;
+			}
+			.card h3 {
+				margin: 0 0 12px;
+				font-size: 1.05rem;
+			}
+			.card p,
+			.card li {
+				color: var(--muted);
+				font-size: 0.95rem;
+			}
+			.card ul {
+				margin: 0;
+				padding-left: 18px;
+			}
+			code,
+			.mono {
+				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+				font-size: 0.88em;
+				background: var(--panel-2);
+				border: 1px solid var(--border);
+				border-radius: 8px;
+				padding: 2px 7px;
+				color: var(--accent);
+				word-break: break-all;
+			}
+			a {
+				color: var(--accent);
+			}
+			.endpoints {
+				display: grid;
+				gap: 10px;
+				margin-top: 6px;
+			}
+			.endpoint {
+				display: flex;
+				justify-content: space-between;
+				gap: 12px;
+				align-items: center;
+				background: var(--panel-2);
+				border: 1px solid var(--border);
+				border-radius: 12px;
+				padding: 10px 14px;
+				font-size: 0.9rem;
+			}
+			.endpoint span {
+				color: var(--muted);
+				white-space: nowrap;
+			}
+			footer {
+				margin-top: 40px;
+				padding-top: 24px;
+				border-top: 1px solid var(--border);
+				color: var(--muted);
+				font-size: 0.88rem;
+				display: flex;
+				justify-content: space-between;
+				gap: 16px;
+				flex-wrap: wrap;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="wrap">
+			<header>
+				<img src="/logo.svg" alt="cf-activity-relay logo" width="64" height="64" />
+				<div>
+					<h1>cf-activity-relay</h1>
+					<p>ActivityPub relay · <span class="mono" id="domain">relay.manalejandro.com</span></p>
+				</div>
+				<span class="badge"><span class="dot"></span><span id="status-label">checking status…</span></span>
+			</header>
+
+			<section class="hero">
+				<h2>One inbox for the fediverse</h2>
+				<p>
+					This server relays public ActivityPub traffic between subscribed instances. Traditional relays register through
+					<code>/inbox</code>; server actors that prefer following can follow the relay actor at <code>/actor</code>. Every delivery is signed
+					with the relay key using legacy Fediverse HTTP signatures or RFC 9421.
+				</p>
+				<div class="stats">
+					<div class="stat">
+						<span>Connected instances</span>
+						<strong id="connected">–</strong>
+						<small>receiving or publishing</small>
+					</div>
+					<div class="stat">
+						<span>Receiving instances</span>
+						<strong id="receiving">–</strong>
+						<small>subscribers and followers</small>
+					</div>
+					<div class="stat">
+						<span>Publishers</span>
+						<strong id="publishers">–</strong>
+						<small>observed senders</small>
+					</div>
+					<div class="stat">
+						<span>Registration</span>
+						<strong id="registration">–</strong>
+						<small id="policy">public posts only</small>
+					</div>
+				</div>
+			</section>
+
+			<div class="grid">
+				<div class="card">
+					<h3>Endpoints</h3>
+					<div class="endpoints">
+						<div class="endpoint"><span>Actor</span><a class="mono" id="ep-actor" href="/actor">/actor</a></div>
+						<div class="endpoint"><span>Shared inbox</span><span class="mono">/inbox</span></div>
+						<div class="endpoint"><span>WebFinger</span><span class="mono">acct:relay@<span id="ep-domain">relay.manalejandro.com</span></span></div>
+						<div class="endpoint"><span>Status</span><a class="mono" href="/status.json">/status.json</a></div>
+						<div class="endpoint"><span>NodeInfo</span><a class="mono" href="/nodeinfo/2.1">/nodeinfo/2.1</a></div>
+					</div>
+				</div>
+				<div class="card">
+					<h3>How to subscribe</h3>
+					<ul>
+						<li><strong>Mastodon / Misskey:</strong> add <span class="mono">https://<span class="ep-domain">relay.manalejandro.com</span>/inbox</span> as a relay.</li>
+						<li><strong>Pleroma / Akkoma / Friendica:</strong> follow <span class="mono">@relay@<span class="ep-domain">relay.manalejandro.com</span></span>.</li>
+						<li><strong>Unsubscribe:</strong> remove the relay or send <span class="mono">Undo&nbsp;Follow</span>.</li>
+					</ul>
+					<p style="margin-top: 14px">
+						Only public activities are distributed. The relay never exposes subscriber identities, inbox URLs or relayed activity history.
+					</p>
+				</div>
+			</div>
+
+			<footer>
+				<span>Built with Cloudflare Workers, D1, KV and Queues.</span>
+				<span><a href="https://github.com/manalejandro/cf-activity-relay" rel="noopener">Source</a> · MIT licensed · <span id="software">cf-activity-relay</span></span>
+			</footer>
+		</div>
+		<script>
+			(async () => {
+				const set = (id, value) => {
+					const node = document.getElementById(id);
+					if (node) node.textContent = value;
+				};
+				try {
+					const response = await fetch('/status.json', { headers: { Accept: 'application/json' } });
+					if (!response.ok) throw new Error('status unavailable');
+					const status = await response.json();
+					set('status-label', status.status === 'ok' ? 'operational' : 'degraded');
+					set('connected', status.connected_instances.count);
+					set('receiving', status.receiving_instances.count);
+					set('publishers', status.publishers.count);
+					set('registration', status.manual_approval ? 'manual' : 'open');
+					set('policy', status.public_address_distribution_label || status.public_address_distribution_policy);
+					set('domain', status.domain);
+					document.querySelectorAll('.ep-domain').forEach((node) => (node.textContent = status.domain));
+					const actor = document.getElementById('ep-actor');
+					if (actor) actor.href = status.endpoints.actor;
+					set('software', status.software.name + ' ' + status.software.version);
+					document.title = status.name + ' — ActivityPub relay';
+				} catch (error) {
+					set('status-label', 'status unavailable');
+				}
+			})();
+		</script>
+	</body>
+</html>
