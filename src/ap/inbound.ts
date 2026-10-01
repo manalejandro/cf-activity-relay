@@ -39,7 +39,7 @@ import { relayAnnounce, relayFollow, relayReply } from './builders';
 import { enqueueDeliveries, enqueueFanOut, enqueueToFollowers, enqueueToSubscribers } from './fanout';
 import type { RelayIdentity } from './identity';
 import { allowsPublicAddress, excludesPublicOnlyInCc } from './policy';
-import { fetchRemoteActor, fetchRemoteJson, forceRefreshActor } from './remote';
+import { fetchRemoteActor, fetchRemoteJson, forceRefreshActor, resolveRemoteActor, type ActorResolution } from './remote';
 
 export interface InboundResponse {
 	status: number;
@@ -48,6 +48,8 @@ export interface InboundResponse {
 	reason?: string;
 	/** Host of the signing key, when one was presented. */
 	keyHost?: string;
+	/** HTTP status of the signer actor fetch (404/410 mean permanently gone). */
+	keyStatus?: number;
 }
 
 interface InboundContext {
@@ -60,7 +62,7 @@ interface InboundContext {
 	body: string;
 }
 
-type Verification = { ok: true; ctx: InboundContext } | { ok: false; reason: string; keyHost?: string };
+type Verification = { ok: true; ctx: InboundContext } | { ok: false; reason: string; keyHost?: string; keyStatus?: number };
 
 // ---------------------------------------------------------------------------
 // Verification
@@ -95,13 +97,17 @@ function parseActivityLoose(body: string): { type?: string; actor?: string; id?:
 
 /**
  * Resolves the signer key, retrying once with a forced refresh. The refresh
- * picks up key rotation and recovers from a stale negative cache entry.
+ * picks up key rotation and recovers from a stale negative cache entry. The
+ * reported status lets callers tell a permanently removed actor (404/410) from
+ * a transient failure.
  */
-async function resolveSignerActor(env: Env, config: RelayConfig, identity: RelayIdentity, keyId: string): Promise<RemoteActor | null> {
-	const actor = await fetchRemoteActor(env, config, identity, keyId, keyId);
-	if (actor?.publicKeyPem) return actor;
+async function resolveSignerActor(env: Env, config: RelayConfig, identity: RelayIdentity, keyId: string): Promise<ActorResolution> {
+	const first = await resolveRemoteActor(env, config, identity, keyId, keyId);
+	if (first.actor?.publicKeyPem) return first;
 	const refreshed = await forceRefreshActor(env, config, identity, keyId, keyId);
-	return refreshed?.publicKeyPem ? refreshed : actor;
+	if (refreshed.actor?.publicKeyPem) return refreshed;
+	// Prefer a real HTTP status over a cached miss.
+	return refreshed.status > 0 ? refreshed : first;
 }
 
 /** Legacy draft-cavage verification with actor/key host binding. */
@@ -120,14 +126,15 @@ async function verifyLegacy(
 	if (!headers['digest']) return { ok: false, reason: 'digest-missing', keyHost };
 	if (!(await digestHeaderMatches(headers['digest'], body))) return { ok: false, reason: 'digest-mismatch', keyHost };
 
-	let signerActor = await resolveSignerActor(env, config, identity, parsed.keyId);
-	if (!signerActor?.publicKeyPem) return { ok: false, reason: 'key-unresolved', keyHost };
+	const resolution = await resolveSignerActor(env, config, identity, parsed.keyId);
+	let signerActor = resolution.actor;
+	if (!signerActor?.publicKeyPem) return { ok: false, reason: 'key-unresolved', keyHost, keyStatus: resolution.status };
 	let verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: signerActor.publicKeyPem });
 	if (!verification.ok) {
 		const refreshed = await forceRefreshActor(env, config, identity, parsed.keyId, parsed.keyId);
-		if (refreshed?.publicKeyPem && refreshed.publicKeyPem !== signerActor.publicKeyPem) {
-			verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: refreshed.publicKeyPem });
-			if (verification.ok) signerActor = refreshed;
+		if (refreshed.actor?.publicKeyPem && refreshed.actor.publicKeyPem !== signerActor.publicKeyPem) {
+			verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: refreshed.actor.publicKeyPem });
+			if (verification.ok) signerActor = refreshed.actor;
 		}
 		if (!verification.ok) return { ok: false, reason: 'signature-invalid', keyHost };
 	}
@@ -165,14 +172,17 @@ async function verifyRfc9421(
 
 	let reason = 'signature-missing';
 	let keyHost: string | undefined;
+	let keyStatus: number | undefined;
 	for (const member of ordered) {
 		const keyId = member.params.keyid;
 		if (!keyId) continue;
 		keyHost = hostOf(keyId);
 
-		let signerActor = await resolveSignerActor(env, config, identity, keyId);
+		const resolution = await resolveSignerActor(env, config, identity, keyId);
+		let signerActor = resolution.actor;
 		if (!signerActor?.publicKeyPem) {
 			reason = 'key-unresolved';
+			keyStatus = resolution.status;
 			continue;
 		}
 		const verify = (publicKeyPem: string) =>
@@ -188,9 +198,9 @@ async function verifyRfc9421(
 		let verification = await verify(signerActor.publicKeyPem);
 		if (!verification.ok) {
 			const refreshed = await forceRefreshActor(env, config, identity, keyId, keyId);
-			if (refreshed?.publicKeyPem && refreshed.publicKeyPem !== signerActor.publicKeyPem) {
-				signerActor = refreshed;
-				verification = await verify(refreshed.publicKeyPem);
+			if (refreshed.actor?.publicKeyPem && refreshed.actor.publicKeyPem !== signerActor.publicKeyPem) {
+				signerActor = refreshed.actor;
+				verification = await verify(refreshed.actor.publicKeyPem);
 			}
 			if (!verification.ok) {
 				reason = 'signature-invalid';
@@ -225,7 +235,7 @@ async function verifyRfc9421(
 		const settings = await loadSettings(env, config);
 		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body } };
 	}
-	return { ok: false, reason, keyHost };
+	return { ok: false, reason, keyHost, keyStatus };
 }
 
 async function loadSettings(env: Env, config: RelayConfig): Promise<RelaySettings> {
@@ -600,6 +610,21 @@ export async function processInboundActivity(env: Env, config: RelayConfig, iden
 		: await verifyLegacy(env, config, identity, request, url.toString(), headers, body);
 	if (!verification.ok) {
 		const partial = parseActivityLoose(body);
+		// Account deletion notices are signed by keys that are already gone: the
+		// actor document returns 404/410, so nobody can verify them. A relay
+		// keeps no account state, so acknowledge the notice without acting on it
+		// instead of making the sender retry it forever.
+		if (verification.reason === 'key-unresolved' && partial.type === 'Delete' && (verification.keyStatus === 404 || verification.keyStatus === 410)) {
+			await recordInbound(env.DB, {
+				at: Math.floor(Date.now() / 1000),
+				type: 'Delete',
+				actorDomain: hostOf(partial.actor ?? '') || verification.keyHost || '',
+				activityId: partial.id ?? null,
+				status: 202,
+				reason: 'unverifiable-delete',
+			});
+			return { status: 202, reason: 'unverifiable-delete', keyHost: verification.keyHost, keyStatus: verification.keyStatus };
+		}
 		await recordInbound(env.DB, {
 			at: Math.floor(Date.now() / 1000),
 			type: partial.type ?? 'unknown',
@@ -608,7 +633,7 @@ export async function processInboundActivity(env: Env, config: RelayConfig, iden
 			status: 400,
 			reason: verification.reason,
 		});
-		return { status: 400, reason: verification.reason, keyHost: verification.keyHost };
+		return { status: 400, reason: verification.reason, keyHost: verification.keyHost, keyStatus: verification.keyStatus };
 	}
 
 	const result = await dispatchInbound(verification.ctx);

@@ -246,6 +246,8 @@ Receiver health (`last_success_at`, `last_failure_at`, `consecutive_failures`, `
    - Public only in `cc` under the strict policy → publisher accounting only.
    - Everything else → `Follow`/`Undo` handling, otherwise `202`.
 
+**Account deletion notices.** Mastodon signs a `Delete` for a removed account with a key whose actor document is already gone (HTTP `404`/`410`), so no server can verify it. A relay keeps no account state, so these notices are acknowledged with `202` and recorded in the audit trail as `unverifiable-delete` — without fan-out and without publisher accounting. Every other activity type with an unresolvable signer key is still rejected with `400`.
+
 ## Local development
 
 ```bash
@@ -284,6 +286,8 @@ The suite runs inside `workerd` with the Cloudflare Vitest plugin and covers:
 - Delivery targets and actor URLs are validated; loopback and private IP literals are refused.
 - The relay's own actor is resolved from local state. A Worker subrequest to the relay's own hostname can deadlock and time out, so self-host fetches are never attempted.
 - Remote documents are read with hard byte limits, and redirects must stay on the same host.
+- Only cryptographically verified activities are counted as publishers or fanned out. The one exception is an account deletion notice whose signer key is permanently gone: it is acknowledged with `202` and has no side effects at all.
+- There is no domain allowlist that skips signature verification.
 - POST signatures must cover the `Digest`/`Content-Digest`, binding the body to the signature.
 - `/status.json` never exposes inbox URLs, actor IDs, blocked-domain lists or queue internals.
 - The relay key lives in D1 (or a Worker secret). Back up `relay_config` or keep `RELAY_PRIVATE_KEY_PEM` in a safe place — replacing the key changes the relay's federation identity.

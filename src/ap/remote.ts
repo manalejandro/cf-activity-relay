@@ -196,36 +196,49 @@ function withResolvedKey(actor: RemoteActor, keyId?: string): RemoteActor {
 	return { ...actor, publicKeyId: key.id, publicKeyPem: key.pem, publicKeyOwner: key.owner };
 }
 
-/** Resolves an actor document through the cache or a signed remote fetch. */
-export async function fetchRemoteActor(
+export interface ActorResolution {
+	actor: RemoteActor | null;
+	/** HTTP status of the last fetch attempt (0 for network or validation errors). */
+	status: number;
+}
+
+/**
+ * Resolves an actor document through the cache or a signed remote fetch,
+ * reporting the HTTP status so callers can tell a permanently removed actor
+ * (404/410) from a transient failure.
+ */
+export async function resolveRemoteActor(
 	env: Env,
 	config: RelayConfig,
 	identity: RelayIdentity,
 	actorUrl: string,
 	keyId?: string,
 	options: { forceRefresh?: boolean } = {},
-): Promise<RemoteActor | null> {
+): Promise<ActorResolution> {
 	const cleaned = stripFragment(actorUrl);
 	const parsed = parseHttpUrl(cleaned);
-	if (!parsed || isPrivateHost(parsed.hostname)) return null;
+	if (!parsed || isPrivateHost(parsed.hostname)) return { actor: null, status: 0 };
 
 	// The relay's own actor is resolved locally. A Worker subrequest to its own
 	// hostname can deadlock and time out (HTTP 522), and there is no reason to
 	// spend a network round trip on data the relay already owns.
 	if (hostOf(cleaned) === config.domain) {
-		if (cleaned !== config.actorId) return null;
+		if (cleaned !== config.actorId) return { actor: null, status: 0 };
 		const { buildRelayActor } = await import('./actor');
 		const raw = await buildRelayActor(env, config);
 		return {
-			id: config.actorId,
-			type: 'Application',
-			inbox: `${config.baseUrl}/inbox`,
-			sharedInbox: `${config.baseUrl}/inbox`,
-			preferredUsername: 'relay',
-			publicKeyId: config.keyId,
-			publicKeyPem: identity.publicKeyPem,
-			publicKeyOwner: config.actorId,
-			raw,
+			status: 200,
+			actor: {
+				id: config.actorId,
+				type: 'Application',
+				inbox: `${config.baseUrl}/inbox`,
+				sharedInbox: `${config.baseUrl}/inbox`,
+				preferredUsername: 'relay',
+				publicKeyId: config.keyId,
+				publicKeyPem: identity.publicKeyPem,
+				publicKeyOwner: config.actorId,
+				raw,
+			},
 		};
 	}
 
@@ -233,8 +246,8 @@ export async function fetchRemoteActor(
 	const failureKey = `actor-fail:${cleaned}`;
 	if (!options.forceRefresh) {
 		const cached = await env.CACHE.get<RemoteActor>(cacheKey, 'json');
-		if (cached) return withResolvedKey(cached, keyId);
-		if (await env.CACHE.get(failureKey)) return null;
+		if (cached) return { actor: withResolvedKey(cached, keyId), status: 200 };
+		if (await env.CACHE.get(failureKey)) return { actor: null, status: 0 };
 	}
 
 	let response: Response;
@@ -243,13 +256,13 @@ export async function fetchRemoteActor(
 	} catch (error) {
 		console.warn('actor fetch failed', { host: hostOf(cleaned), error: error instanceof Error ? error.message : String(error) });
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: 0 };
 	}
 	if (!response.ok) {
 		console.warn('actor fetch rejected', { host: hostOf(cleaned), status: response.status });
 		await discardBody(response);
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: response.status };
 	}
 
 	let location = response;
@@ -267,40 +280,52 @@ export async function fetchRemoteActor(
 		// match the requested actor host for the signature binding to hold.
 		if (hostOf(next.toString()) !== hostOf(cleaned)) {
 			await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-			return null;
+			return { actor: null, status: 0 };
 		}
 		({ response: location } = await signedFetch(env, config, identity, next.toString(), { method: 'GET', scope: 'fetch' }));
 	}
 	if (!location.ok) {
 		await discardBody(location);
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: location.status };
 	}
 
 	const text = await readTextBounded(location, MAX_REMOTE_DOCUMENT_BYTES);
 	if (text === null) {
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: 200 };
 	}
 	let raw: Record<string, unknown>;
 	try {
 		raw = JSON.parse(text) as Record<string, unknown>;
 	} catch {
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: 200 };
 	}
 	if (typeof raw.id !== 'string' || hostOf(raw.id) !== hostOf(cleaned)) {
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: 200 };
 	}
 	const actor = toRemoteActor(raw, keyId);
 	if (!actor) {
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
-		return null;
+		return { actor: null, status: 200 };
 	}
 	await env.CACHE.put(cacheKey, JSON.stringify(actor), { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
 	await env.CACHE.delete(failureKey);
-	return actor;
+	return { actor, status: 200 };
+}
+
+/** Resolves an actor document, discarding the fetch status. */
+export async function fetchRemoteActor(
+	env: Env,
+	config: RelayConfig,
+	identity: RelayIdentity,
+	actorUrl: string,
+	keyId?: string,
+	options: { forceRefresh?: boolean } = {},
+): Promise<RemoteActor | null> {
+	return (await resolveRemoteActor(env, config, identity, actorUrl, keyId, options)).actor;
 }
 
 /**
@@ -309,13 +334,13 @@ export async function fetchRemoteActor(
  * every request. Used after a verification failure to pick up key rotation and
  * to recover from a stale negative entry.
  */
-export async function forceRefreshActor(env: Env, config: RelayConfig, identity: RelayIdentity, actorUrl: string, keyId?: string): Promise<RemoteActor | null> {
+export async function forceRefreshActor(env: Env, config: RelayConfig, identity: RelayIdentity, actorUrl: string, keyId?: string): Promise<ActorResolution> {
 	const cleaned = stripFragment(actorUrl);
-	if (!cleaned || hostOf(cleaned) === config.domain) return null;
+	if (!cleaned || hostOf(cleaned) === config.domain) return { actor: null, status: 0 };
 	const throttleKey = `actor-refresh:${cleaned}`;
-	if (await env.CACHE.get(throttleKey)) return null;
+	if (await env.CACHE.get(throttleKey)) return { actor: null, status: 0 };
 	await env.CACHE.put(throttleKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
-	return fetchRemoteActor(env, config, identity, cleaned, keyId, { forceRefresh: true });
+	return resolveRemoteActor(env, config, identity, cleaned, keyId, { forceRefresh: true });
 }
 
 /** Invalidates the cached document for an actor URL. */

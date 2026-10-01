@@ -10,6 +10,8 @@ const REMOTE_KEY = `${REMOTE_ACTOR}#main-key`;
 const REMOTE_INBOX = 'https://remote.example/inbox';
 const PERSON_ACTOR = 'https://remote.example/users/alice';
 const PERSON_KEY = `${PERSON_ACTOR}#main-key`;
+const DELETED_ACTOR = 'https://remote.example/users/deleted';
+const DELETED_KEY = `${DELETED_ACTOR}#main-key`;
 const PUBLIC_ADDRESS = 'https://www.w3.org/ns/activitystreams#Public';
 
 let privateKeyPem = '';
@@ -19,6 +21,9 @@ let publicKeyPem = '';
 function stubFederation(): ReturnType<typeof vi.fn> {
 	const mock = vi.fn(async (input: RequestInfo | URL) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+		// A deleted account: its actor document is gone, so its key can never be
+		// resolved. Mastodon still signs the account deletion notice with it.
+		if (url === DELETED_ACTOR) return new Response('gone', { status: 410 });
 		if (url === REMOTE_ACTOR || url === PERSON_ACTOR) {
 			const isPerson = url === PERSON_ACTOR;
 			return new Response(
@@ -207,6 +212,43 @@ describe('inbound inbox processing', () => {
 		} finally {
 			testEnv.ADMIN_TOKEN = undefined;
 		}
+	});
+
+	it('acknowledges an unverifiable account deletion notice', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: `${DELETED_ACTOR}#delete`,
+			type: 'Delete',
+			actor: DELETED_ACTOR,
+			to: [`${DELETED_ACTOR}/followers`],
+			object: DELETED_ACTOR,
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: DELETED_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+
+		// The account is gone, so the notice cannot be verified. A relay holds no
+		// account state: acknowledge it without fan-out or publisher accounting.
+		expect(response.status).toBe(202);
+		const publishers = await env.DB.prepare('SELECT COUNT(*) AS total FROM publishers').first<{ total: number }>();
+		expect(publishers?.total).toBe(0);
+		const entry = await env.DB.prepare('SELECT type, status, reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ type: string; status: number; reason: string }>();
+		expect(entry).toMatchObject({ type: 'Delete', status: 202, reason: 'unverifiable-delete' });
+	});
+
+	it('still rejects other activities whose signer key is gone', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/ghost-create',
+			type: 'Create',
+			actor: DELETED_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: { id: 'https://remote.example/notes/ghost', type: 'Note' },
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: DELETED_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(400);
 	});
 
 	it('does not fan out an activity that is only public in cc', async () => {
