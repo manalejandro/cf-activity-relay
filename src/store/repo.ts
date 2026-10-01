@@ -14,11 +14,13 @@ const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS signature_nonces (hash TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS signature_capabilities (origin TEXT NOT NULL, scope TEXT NOT NULL, profile TEXT NOT NULL, observed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (origin, scope))`,
 	`CREATE TABLE IF NOT EXISTS delivered_activities (activity_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS inbound_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, type TEXT NOT NULL, actor_domain TEXT NOT NULL, activity_id TEXT, status INTEGER NOT NULL, reason TEXT)`,
 	`CREATE INDEX IF NOT EXISTS idx_payloads_created ON activity_payloads (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_canonical_created ON canonical_activities (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_nonces_created ON signature_nonces (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_delivered_created ON delivered_activities (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_capabilities_expires ON signature_capabilities (expires_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_inbound_log_at ON inbound_log (at)`,
 ];
 
 let schemaPromise: Promise<void> | null = null;
@@ -530,5 +532,46 @@ export async function cleanupExpired(db: D1Database): Promise<void> {
 		db.prepare('DELETE FROM signature_nonces WHERE created_at < ?').bind(now - 600),
 		db.prepare('DELETE FROM delivered_activities WHERE created_at < ?').bind(now - 86400),
 		db.prepare('DELETE FROM signature_capabilities WHERE expires_at < ?').bind(now - 3600),
+		db.prepare('DELETE FROM inbound_log WHERE at < ?').bind(now - 7 * 86400),
 	]);
+}
+
+// ---------------------------------------------------------------------------
+// Inbound audit trail
+// ---------------------------------------------------------------------------
+
+export interface InboundLogEntry {
+	at: number;
+	type: string;
+	actorDomain: string;
+	activityId: string | null;
+	status: number;
+	reason: string | null;
+}
+
+/** Records one inbound inbox event for operators. Never throws. */
+export async function recordInbound(db: D1Database, entry: InboundLogEntry): Promise<void> {
+	try {
+		await db
+			.prepare('INSERT INTO inbound_log (at, type, actor_domain, activity_id, status, reason) VALUES (?, ?, ?, ?, ?, ?)')
+			.bind(entry.at, entry.type.slice(0, 64), entry.actorDomain.slice(0, 255), entry.activityId?.slice(0, 512) ?? null, entry.status, entry.reason?.slice(0, 64) ?? null)
+			.run();
+	} catch (error) {
+		console.error('unable to record inbound audit entry', { error: error instanceof Error ? error.message : String(error) });
+	}
+}
+
+export interface InboundLogRow {
+	at: number;
+	type: string;
+	actor_domain: string;
+	activity_id: string | null;
+	status: number;
+	reason: string | null;
+}
+
+export async function listInboundLog(db: D1Database, limit = 50): Promise<InboundLogRow[]> {
+	const bounded = Math.min(Math.max(limit, 1), 200);
+	const rows = await db.prepare('SELECT at, type, actor_domain, activity_id, status, reason FROM inbound_log ORDER BY id DESC LIMIT ?').bind(bounded).all<InboundLogRow>();
+	return rows.results ?? [];
 }

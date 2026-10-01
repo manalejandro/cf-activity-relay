@@ -181,6 +181,9 @@ Enabled only when `ADMIN_TOKEN` is set. Every request needs `Authorization: Bear
 | Request | Description |
 | --- | --- |
 | `GET /admin/state` | Subscribers, followers, pending requests, publishers, blocked/limited lists, counts and settings. |
+| `GET /admin/log?limit=50` | Recent inbound events (type, actor domain, activity ID, status, reason). Retained for 7 days. |
+| `POST /admin/subscribe` | Body `{"actor":"https://instance.example/actor"}`. Resolves the actor's shared inbox and registers it as a traditional receiver. |
+| `POST /admin/unsubscribe` | Body `{"domain":"instance.example"}`. Removes the subscriber, follower and pending records for that domain. |
 | `POST /admin/pending/:domain/accept` | Approve a pending follow: stores the receiver, sends `Accept` and the reciprocal `Follow` for follower-style requests. |
 | `POST /admin/pending/:domain/reject` | Send `Reject` and drop the request. |
 | `POST /admin/domains/:domain/block` | Block a domain (hard rejection). |
@@ -195,10 +198,30 @@ Examples:
 ```bash
 TOKEN=...
 curl -s -H "Authorization: Bearer $TOKEN" https://relay.example.org/admin/state | jq .
+curl -s -H "Authorization: Bearer $TOKEN" 'https://relay.example.org/admin/log?limit=20' | jq .
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+	-d '{"actor":"https://instance.example/actor"}' https://relay.example.org/admin/subscribe | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" https://relay.example.org/admin/pending/mastodon.example/accept | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 	-d '{"manuallyAccept":true}' https://relay.example.org/admin/settings | jq .
 ```
+
+## Who can subscribe
+
+A relay connects **instances**, never personal accounts:
+
+- **Mastodon / Misskey** instances subscribe by sending a `Follow` whose object is the
+  ActivityStreams Public collection. The relay stores the instance's shared inbox and
+  returns `Accept`. This is what the Mastodon administration relay form does.
+- **Pleroma, Akkoma, Friendica and similar servers** follow the relay *actor* from their
+  server actor (`Application`/`Service`, or an actor at `/relay` or `/friendica`). The relay
+  stores the actor's inbox, returns `Accept` and sends a reciprocal `Follow`.
+- **A personal account following the relay actor is rejected on purpose.** Accepting it would
+  deliver every relayed public activity to one person's home timeline. The rejection reason is
+  visible in `GET /admin/log` as `not-a-server-actor`.
+
+Operators can also provision a receiver directly with `POST /admin/subscribe`, which resolves
+an actor's shared inbox and registers it without requiring a relay UI on the remote server.
 
 ## Delivery and retries
 

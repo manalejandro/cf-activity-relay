@@ -8,6 +8,8 @@ const RELAY = 'https://relay.manalejandro.com';
 const REMOTE_ACTOR = 'https://remote.example/actor';
 const REMOTE_KEY = `${REMOTE_ACTOR}#main-key`;
 const REMOTE_INBOX = 'https://remote.example/inbox';
+const PERSON_ACTOR = 'https://remote.example/users/alice';
+const PERSON_KEY = `${PERSON_ACTOR}#main-key`;
 const PUBLIC_ADDRESS = 'https://www.w3.org/ns/activitystreams#Public';
 
 let privateKeyPem = '';
@@ -17,20 +19,21 @@ let publicKeyPem = '';
 function stubFederation(): ReturnType<typeof vi.fn> {
 	const mock = vi.fn(async (input: RequestInfo | URL) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-		if (url === REMOTE_ACTOR) {
+		if (url === REMOTE_ACTOR || url === PERSON_ACTOR) {
+			const isPerson = url === PERSON_ACTOR;
 			return new Response(
 				JSON.stringify({
 					'@context': 'https://www.w3.org/ns/activitystreams',
-					id: REMOTE_ACTOR,
-					type: 'Application',
-					inbox: REMOTE_INBOX,
+					id: url,
+					type: isPerson ? 'Person' : 'Application',
+					inbox: isPerson ? 'https://remote.example/users/alice/inbox' : REMOTE_INBOX,
 					endpoints: { sharedInbox: REMOTE_INBOX },
-					publicKey: { id: REMOTE_KEY, owner: REMOTE_ACTOR, publicKeyPem },
+					publicKey: { id: isPerson ? PERSON_KEY : REMOTE_KEY, owner: url, publicKeyPem },
 				}),
 				{ headers: { 'Content-Type': 'application/activity+json' } },
 			);
 		}
-		if (url === REMOTE_INBOX) return new Response('', { status: 202 });
+		if (url === REMOTE_INBOX || url === 'https://remote.example/users/alice/inbox') return new Response('', { status: 202 });
 		return new Response('not found', { status: 404 });
 	});
 	vi.stubGlobal('fetch', mock);
@@ -135,6 +138,75 @@ describe('inbound inbox processing', () => {
 		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
 		expect(response.status).toBe(202);
 		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('relay.manalejandro.com').first()).toBeFalsy();
+	});
+
+	it('records inbound events in the audit trail', async () => {
+		stubFederation();
+		const body = followActivity('https://remote.example/activities/follow-audit');
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+
+		const accepted = await env.DB.prepare('SELECT type, actor_domain, status FROM inbound_log ORDER BY id DESC LIMIT 1').first<{
+			type: string;
+			actor_domain: string;
+			status: number;
+		}>();
+		expect(accepted).toMatchObject({ type: 'Follow', actor_domain: 'remote.example', status: 202 });
+
+		await SELF.fetch(`${RELAY}/inbox`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/activity+json' },
+			body: followActivity('https://remote.example/activities/follow-unsigned-audit'),
+		});
+		const rejected = await env.DB.prepare('SELECT type, actor_domain, status, reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{
+			type: string;
+			actor_domain: string;
+			status: number;
+			reason: string;
+		}>();
+		expect(rejected).toMatchObject({ type: 'Follow', actor_domain: 'remote.example', status: 400, reason: 'signature-missing' });
+	});
+
+	it('rejects a personal account following the relay actor', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/person-follow',
+			type: 'Follow',
+			actor: PERSON_ACTOR,
+			object: `${RELAY}/actor`,
+			to: [`${RELAY}/actor`],
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PERSON_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		// A personal account must never become a relay receiver: it would
+		// receive every relayed public activity in its home timeline.
+		expect(await env.DB.prepare('SELECT 1 AS present FROM followers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
+		const entry = await env.DB.prepare('SELECT type, status, reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ type: string; status: number; reason: string }>();
+		expect(entry).toMatchObject({ type: 'Follow', status: 202, reason: 'not-a-server-actor' });
+	});
+
+	it('provisions a subscriber through the admin API', async () => {
+		stubFederation();
+		const testEnv = env as unknown as { ADMIN_TOKEN?: string };
+		testEnv.ADMIN_TOKEN = 'test-token';
+		try {
+			const response = await SELF.fetch(`${RELAY}/admin/subscribe`, {
+				method: 'POST',
+				headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ actor: REMOTE_ACTOR }),
+			});
+			expect(response.status).toBe(200);
+			const row = await env.DB.prepare('SELECT inbox_url, actor_id FROM subscribers WHERE domain = ?')
+				.bind('remote.example')
+				.first<{ inbox_url: string; actor_id: string }>();
+			expect(row?.inbox_url).toBe(REMOTE_INBOX);
+			expect(row?.actor_id).toBe(REMOTE_ACTOR);
+		} finally {
+			testEnv.ADMIN_TOKEN = undefined;
+		}
 	});
 
 	it('does not fan out an activity that is only public in cc', async () => {

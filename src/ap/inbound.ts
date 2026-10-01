@@ -26,6 +26,7 @@ import {
 	loadRelaySettings,
 	putPending,
 	recordPublisher,
+	recordInbound,
 	releaseCanonical,
 	reserveActivity,
 	reserveCanonical,
@@ -74,6 +75,21 @@ function parseActivity(body: string): APActivity | null {
 		return parsed;
 	} catch {
 		return null;
+	}
+}
+
+/** Best-effort activity shape for the audit trail of rejected requests. */
+function parseActivityLoose(body: string): { type?: string; actor?: string; id?: string } {
+	try {
+		const parsed = JSON.parse(body) as Record<string, unknown>;
+		if (!parsed || typeof parsed !== 'object') return {};
+		return {
+			type: typeof parsed.type === 'string' ? parsed.type : undefined,
+			actor: typeof parsed.actor === 'string' ? parsed.actor : undefined,
+			id: typeof parsed.id === 'string' ? parsed.id : undefined,
+		};
+	} catch {
+		return {};
 	}
 }
 
@@ -402,13 +418,13 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 	const inbox = ctx.actor.inbox ?? ctx.actor.sharedInbox;
 	if (await isBlocked(ctx.env.DB, actorDomain)) {
 		await sendReply(ctx, 'Reject', inbox);
-		return { status: 202 };
+		return { status: 202, reason: 'blocked' };
 	}
 	// A relay must never subscribe to itself: a self-referential receiver would
 	// re-enter the fan-out path and could loop on relay-authored wrappers.
 	if (actorDomain === ctx.config.domain) {
 		await sendReply(ctx, 'Reject', inbox);
-		return { status: 202 };
+		return { status: 202, reason: 'self' };
 	}
 	const objectValues = asStringArray(ctx.activity.object);
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
@@ -422,7 +438,7 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 				object: PUBLIC_ADDRESS,
 				createdAt: new Date().toISOString(),
 			});
-			return { status: 202 };
+			return { status: 202, reason: 'pending' };
 		}
 		await sendReply(ctx, 'Accept', inbox);
 		await addSubscriber(ctx.env.DB, {
@@ -431,12 +447,15 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 			activityId: ctx.activity.id ?? '',
 			actorId: ctx.actor.id,
 		});
-		return { status: 202 };
+		return { status: 202, reason: 'subscribed' };
 	}
 	if (objectValues.includes(ctx.config.actorId)) {
 		if (!isActorAbleToBeFollower(ctx.actor)) {
+			// Only server actors subscribe by following the relay actor. A
+			// personal account following it would otherwise receive every
+			// relayed public activity in its home timeline.
 			await sendReply(ctx, 'Reject', inbox);
-			return { status: 202 };
+			return { status: 202, reason: 'not-a-server-actor' };
 		}
 		if (ctx.settings.manuallyAccept) {
 			await putPending(ctx.env.DB, {
@@ -448,7 +467,7 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 				object: ctx.config.actorId,
 				createdAt: new Date().toISOString(),
 			});
-			return { status: 202 };
+			return { status: 202, reason: 'pending' };
 		}
 		await addFollower(ctx.env.DB, {
 			domain: actorDomain,
@@ -460,10 +479,10 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 		if (!(await isLimited(ctx.env.DB, actorDomain))) {
 			await sendActivity(ctx, ctx.actor.inbox, JSON.stringify(relayFollow(ctx.config, ctx.actor.id)));
 		}
-		return { status: 202 };
+		return { status: 202, reason: 'followed' };
 	}
 	await sendReply(ctx, 'Reject', inbox);
-	return { status: 202 };
+	return { status: 202, reason: 'unsupported-follow' };
 }
 
 async function executeUnfollowing(ctx: InboundContext, innerFollow: Record<string, unknown>): Promise<InboundResponse> {
@@ -472,15 +491,15 @@ async function executeUnfollowing(ctx: InboundContext, innerFollow: Record<strin
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
 		await deleteSubscriber(ctx.env.DB, actorDomain);
 		await deletePending(ctx.env.DB, actorDomain);
-		return { status: 202 };
+		return { status: 202, reason: 'unsubscribed' };
 	}
 	if (objectValues.includes(ctx.config.actorId) && isActorAbleToBeFollower(ctx.actor)) {
 		await deleteFollower(ctx.env.DB, actorDomain);
 		await deletePending(ctx.env.DB, actorDomain);
-		return { status: 202 };
+		return { status: 202, reason: 'unfollowed' };
 	}
 	await sendReply(ctx, 'Reject', ctx.actor.inbox ?? ctx.actor.sharedInbox);
-	return { status: 202 };
+	return { status: 202, reason: 'unsupported-undo' };
 }
 
 /** Unwraps an `Undo{Follow}`; returns null when the inner activity is not a Follow. */
@@ -579,6 +598,27 @@ export async function processInboundActivity(env: Env, config: RelayConfig, iden
 	const verification = usesRfc9421
 		? await verifyRfc9421(env, config, identity, request, url.toString(), headers, body)
 		: await verifyLegacy(env, config, identity, request, url.toString(), headers, body);
-	if (!verification.ok) return { status: 400, reason: verification.reason, keyHost: verification.keyHost };
-	return dispatchInbound(verification.ctx);
+	if (!verification.ok) {
+		const partial = parseActivityLoose(body);
+		await recordInbound(env.DB, {
+			at: Math.floor(Date.now() / 1000),
+			type: partial.type ?? 'unknown',
+			actorDomain: hostOf(partial.actor ?? '') || verification.keyHost || '',
+			activityId: partial.id ?? null,
+			status: 400,
+			reason: verification.reason,
+		});
+		return { status: 400, reason: verification.reason, keyHost: verification.keyHost };
+	}
+
+	const result = await dispatchInbound(verification.ctx);
+	await recordInbound(env.DB, {
+		at: Math.floor(Date.now() / 1000),
+		type: verification.ctx.activity.type,
+		actorDomain: hostOf(verification.ctx.actor.id),
+		activityId: verification.ctx.activity.id ?? null,
+		status: result.status,
+		reason: result.reason ?? null,
+	});
+	return result;
 }

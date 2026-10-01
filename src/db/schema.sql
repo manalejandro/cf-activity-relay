@@ -96,8 +96,19 @@ CREATE TABLE IF NOT EXISTS delivered_activities (
 	created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS inbound_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	at INTEGER NOT NULL,
+	type TEXT NOT NULL,
+	actor_domain TEXT NOT NULL,
+	activity_id TEXT,
+	status INTEGER NOT NULL,
+	reason TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_payloads_created ON activity_payloads (created_at);
 CREATE INDEX IF NOT EXISTS idx_canonical_created ON canonical_activities (created_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_created ON signature_nonces (created_at);
 CREATE INDEX IF NOT EXISTS idx_delivered_created ON delivered_activities (created_at);
 CREATE INDEX IF NOT EXISTS idx_capabilities_expires ON signature_capabilities (expires_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_log_at ON inbound_log (at);

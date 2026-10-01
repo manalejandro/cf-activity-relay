@@ -12,11 +12,14 @@ import { enqueueDeliveries, enqueueFanOut } from '../ap/fanout';
 import {
 	addFollower,
 	addSubscriber,
+	deleteFollower,
 	deletePending,
+	deleteSubscriber,
 	getPending,
 	isLimited,
 	listBlockedDomains,
 	listFollowers,
+	listInboundLog,
 	listLimitedDomains,
 	listPending,
 	listPublishers,
@@ -26,6 +29,7 @@ import {
 	setDomainPolicy,
 } from '../store/repo';
 import type { APActivity } from '../types';
+import { hostOf } from '../utils/domains';
 import { jsonResponse, notFound, textResponse } from '../utils/http';
 
 function unauthorized(): Response {
@@ -51,6 +55,50 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 	const segments = url.pathname.split('/').filter(Boolean);
 	// segments[0] === 'admin'
 	const section = segments[1];
+
+	if (section === 'log' && request.method === 'GET') {
+		const requested = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
+		const rows = await listInboundLog(env.DB, Number.isFinite(requested) ? requested : 50);
+		return jsonResponse({
+			entries: rows.map((row) => ({
+				at: new Date(row.at * 1000).toISOString(),
+				type: row.type,
+				actor: row.actor_domain,
+				activity_id: row.activity_id,
+				status: row.status,
+				reason: row.reason,
+			})),
+		});
+	}
+
+	if (section === 'subscribe' && request.method === 'POST') {
+		// Operator-provisioned traditional subscription: resolves the actor's
+		// shared inbox and registers it as a receiver, exactly like an accepted
+		// `Follow` whose object is the Public collection.
+		const body = await readJsonBody(request);
+		const actorUrl = typeof body?.actor === 'string' ? body.actor : '';
+		if (!actorUrl) return textResponse('actor is required', 400);
+		const { getRelayIdentity } = await import('../ap/identity');
+		const { fetchRemoteActor } = await import('../ap/remote');
+		const identity = await getRelayIdentity(env, config);
+		const actor = await fetchRemoteActor(env, config, identity, actorUrl);
+		if (!actor) return textResponse('unable to resolve the actor', 404);
+		const inboxUrl = actor.sharedInbox ?? actor.inbox;
+		const domain = hostOf(actor.id);
+		if (!inboxUrl || !domain) return textResponse('the actor has no usable inbox', 400);
+		await addSubscriber(env.DB, { domain, inboxUrl, activityId: `urn:cf-activity-relay:admin:${Date.now()}`, actorId: actor.id });
+		return jsonResponse({ status: 'subscribed', domain, inbox_url: inboxUrl, actor: actor.id });
+	}
+
+	if (section === 'unsubscribe' && request.method === 'POST') {
+		const body = await readJsonBody(request);
+		const domain = typeof body?.domain === 'string' ? body.domain.trim().toLowerCase().replace(/\.$/, '') : '';
+		if (!domain) return textResponse('domain is required', 400);
+		await deleteSubscriber(env.DB, domain);
+		await deleteFollower(env.DB, domain);
+		await deletePending(env.DB, domain);
+		return jsonResponse({ status: 'unsubscribed', domain });
+	}
 
 	if (section === 'state' && request.method === 'GET') {
 		const [subscribers, followers, pending, publishers, blocked, limited, settings] = await Promise.all([

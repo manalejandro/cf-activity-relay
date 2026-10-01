@@ -240,11 +240,13 @@ export async function fetchRemoteActor(
 	let response: Response;
 	try {
 		({ response } = await signedFetch(env, config, identity, cleaned, { method: 'GET', scope: 'fetch' }));
-	} catch {
+	} catch (error) {
+		console.warn('actor fetch failed', { host: hostOf(cleaned), error: error instanceof Error ? error.message : String(error) });
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	if (!response.ok) {
+		console.warn('actor fetch rejected', { host: hostOf(cleaned), status: response.status });
 		await discardBody(response);
 		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
