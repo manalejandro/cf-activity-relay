@@ -165,3 +165,8 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# Local secrets and key material
+*.pem
+*-admin-token.txt
+relay-admin-token.txt
