@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { generateRsaKeyPair, importPrivateKey, importPublicKey, parsePem, pkcs1ToPkcs8, pkcs1ToSpki, publicKeyPemFromPrivate, publicKeySpkiDer } from '../src/crypto/keys';
+import { generateRsaKeyPair, importPrivateKey, importPublicKey, parsePem, pkcs1ToPkcs8, pkcs1ToSpki, publicKeyPemFromPrivate, publicKeySpkiDer, RSA_ALGORITHM } from '../src/crypto/keys';
 import { digestHeaderMatches, parseSignatureHeader, signLegacyRequest, verifyLegacySignature } from '../src/crypto/legacy';
 import { contentDigestMatches, parseSignatureInput, signRfc9421Request, verifyRfc9421Signature } from '../src/crypto/rfc9421';
 import { sha256Base64, timingSafeEqual } from '../src/crypto/digest';
@@ -119,6 +119,52 @@ describe('RFC 9421 HTTP message signatures', () => {
 			body,
 			publicKeyPem,
 			expectedAuthority: 'other.example',
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	it('verifies a Mastodon-style minimal component signature', async () => {
+		// Mastodon retries with RFC 9421 after a failed draft-cavage attempt and
+		// signs only @method, @target-uri and content-digest, without a tag.
+		const body = JSON.stringify({ type: 'Delete', actor: 'https://mastodon.social/users/example' });
+		const contentDigest = `sha-256=:${await sha256Base64(body)}:`;
+		const params = `("@method" "@target-uri" "content-digest");created=${Math.floor(Date.now() / 1000)};keyid="${KEY_ID}";alg="rsa-v1_5-sha256"`;
+		const signingString = [`"@method": POST`, `"@target-uri": ${URL}`, `"content-digest": ${contentDigest}`, `"@signature-params": ${params}`].join('\n');
+		const key = await importPrivateKey(privateKeyPem);
+		const signature = new Uint8Array(await crypto.subtle.sign(RSA_ALGORITHM, key, new TextEncoder().encode(signingString)));
+		const result = await verifyRfc9421Signature({
+			method: 'POST',
+			url: URL,
+			headers: {
+				'content-digest': contentDigest,
+				'signature-input': `sig1=${params}`,
+				signature: `sig1=:${btoa(String.fromCharCode(...signature))}:`,
+			},
+			body,
+			publicKeyPem,
+			expectedAuthority: 'relay.example',
+		});
+		expect(result.ok, result.error).toBe(true);
+		expect(result.keyId).toBe(KEY_ID);
+	});
+
+	it('requires the request target to be covered', async () => {
+		const body = JSON.stringify({ type: 'Create' });
+		const contentDigest = `sha-256=:${await sha256Base64(body)}:`;
+		const params = `("@method" "content-digest");created=${Math.floor(Date.now() / 1000)};keyid="${KEY_ID}"`;
+		const signingString = [`"@method": POST`, `"content-digest": ${contentDigest}`, `"@signature-params": ${params}`].join('\n');
+		const key = await importPrivateKey(privateKeyPem);
+		const signature = new Uint8Array(await crypto.subtle.sign(RSA_ALGORITHM, key, new TextEncoder().encode(signingString)));
+		const result = await verifyRfc9421Signature({
+			method: 'POST',
+			url: URL,
+			headers: {
+				'content-digest': contentDigest,
+				'signature-input': `sig1=${params}`,
+				signature: `sig1=:${btoa(String.fromCharCode(...signature))}:`,
+			},
+			body,
+			publicKeyPem,
 		});
 		expect(result.ok).toBe(false);
 	});

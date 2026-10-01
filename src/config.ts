@@ -19,6 +19,8 @@ export const DELIVERY_TIMEOUT_MS = 5000;
 export const FETCH_TIMEOUT_MS = 10000;
 /** Remote actor cache TTL in seconds. */
 export const ACTOR_CACHE_TTL_SECONDS = 300;
+/** Negative actor lookup cache TTL in seconds. */
+export const ACTOR_FAILURE_TTL_SECONDS = 60;
 /** How long shared fan-out payloads are retained. */
 export const PAYLOAD_TTL_SECONDS = 900;
 /** Replay-protection retention for RFC 9421 nonces. */

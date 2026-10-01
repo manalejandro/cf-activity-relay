@@ -7,6 +7,7 @@
  */
 import {
 	ACTOR_CACHE_TTL_SECONDS,
+	ACTOR_FAILURE_TTL_SECONDS,
 	CAPABILITY_LEGACY_TTL_SECONDS,
 	CAPABILITY_RFC9421_TTL_SECONDS,
 	FETCH_TIMEOUT_MS,
@@ -196,7 +197,14 @@ function withResolvedKey(actor: RemoteActor, keyId?: string): RemoteActor {
 }
 
 /** Resolves an actor document through the cache or a signed remote fetch. */
-export async function fetchRemoteActor(env: Env, config: RelayConfig, identity: RelayIdentity, actorUrl: string, keyId?: string): Promise<RemoteActor | null> {
+export async function fetchRemoteActor(
+	env: Env,
+	config: RelayConfig,
+	identity: RelayIdentity,
+	actorUrl: string,
+	keyId?: string,
+	options: { forceRefresh?: boolean } = {},
+): Promise<RemoteActor | null> {
 	const cleaned = stripFragment(actorUrl);
 	const parsed = parseHttpUrl(cleaned);
 	if (!parsed || isPrivateHost(parsed.hostname)) return null;
@@ -222,22 +230,23 @@ export async function fetchRemoteActor(env: Env, config: RelayConfig, identity: 
 	}
 
 	const cacheKey = `actor:${cleaned}`;
-	const cached = await env.CACHE.get<RemoteActor>(cacheKey, 'json');
-	if (cached) return withResolvedKey(cached, keyId);
-
 	const failureKey = `actor-fail:${cleaned}`;
-	if (await env.CACHE.get(failureKey)) return null;
+	if (!options.forceRefresh) {
+		const cached = await env.CACHE.get<RemoteActor>(cacheKey, 'json');
+		if (cached) return withResolvedKey(cached, keyId);
+		if (await env.CACHE.get(failureKey)) return null;
+	}
 
 	let response: Response;
 	try {
 		({ response } = await signedFetch(env, config, identity, cleaned, { method: 'GET', scope: 'fetch' }));
 	} catch {
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	if (!response.ok) {
 		await discardBody(response);
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 
@@ -255,40 +264,56 @@ export async function fetchRemoteActor(env: Env, config: RelayConfig, identity: 
 		// A redirect must stay on the same host: the actor document host has to
 		// match the requested actor host for the signature binding to hold.
 		if (hostOf(next.toString()) !== hostOf(cleaned)) {
-			await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+			await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 			return null;
 		}
 		({ response: location } = await signedFetch(env, config, identity, next.toString(), { method: 'GET', scope: 'fetch' }));
 	}
 	if (!location.ok) {
 		await discardBody(location);
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 
 	const text = await readTextBounded(location, MAX_REMOTE_DOCUMENT_BYTES);
 	if (text === null) {
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	let raw: Record<string, unknown>;
 	try {
 		raw = JSON.parse(text) as Record<string, unknown>;
 	} catch {
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	if (typeof raw.id !== 'string' || hostOf(raw.id) !== hostOf(cleaned)) {
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	const actor = toRemoteActor(raw, keyId);
 	if (!actor) {
-		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+		await env.CACHE.put(failureKey, '1', { expirationTtl: ACTOR_FAILURE_TTL_SECONDS });
 		return null;
 	}
 	await env.CACHE.put(cacheKey, JSON.stringify(actor), { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+	await env.CACHE.delete(failureKey);
 	return actor;
+}
+
+/**
+ * Re-resolves an actor once, bypassing the positive and negative caches, and
+ * throttles refreshes per actor so a failing signature cannot cause a fetch on
+ * every request. Used after a verification failure to pick up key rotation and
+ * to recover from a stale negative entry.
+ */
+export async function forceRefreshActor(env: Env, config: RelayConfig, identity: RelayIdentity, actorUrl: string, keyId?: string): Promise<RemoteActor | null> {
+	const cleaned = stripFragment(actorUrl);
+	if (!cleaned || hostOf(cleaned) === config.domain) return null;
+	const throttleKey = `actor-refresh:${cleaned}`;
+	if (await env.CACHE.get(throttleKey)) return null;
+	await env.CACHE.put(throttleKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
+	return fetchRemoteActor(env, config, identity, cleaned, keyId, { forceRefresh: true });
 }
 
 /** Invalidates the cached document for an actor URL. */

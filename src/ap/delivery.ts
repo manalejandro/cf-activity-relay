@@ -41,7 +41,6 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 		return;
 	}
 	const domain = hostOf(task.inboxUrl);
-	const startedAt = Date.now();
 	let response: Response | null = null;
 	let errorText: string | null = null;
 	try {
@@ -64,7 +63,7 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 		await ignoreFailure(() => recordReceiverSuccess(env.DB, domain));
 		await decrementPayload(env.DB, task.payloadId);
 		message.ack();
-		console.log('delivery succeeded', { domain, status: response.status, profile: task.profile, elapsedMs: Date.now() - startedAt });
+		console.log('delivery ok', { domain, status: response.status, profile: task.profile });
 		return;
 	}
 
@@ -75,18 +74,18 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 		await ignoreFailure(() => recordReceiverFailure(env.DB, domain));
 		await decrementPayload(env.DB, task.payloadId);
 		message.ack();
-		console.warn('delivery failed permanently', {
+		console.warn('delivery failed', {
 			domain,
 			status,
-			profile: task.profile,
 			attempts: message.attempts,
-			error: errorText ?? responseText,
+			profile: task.profile,
+			error: (errorText ?? responseText).slice(0, 200),
 		});
 		return;
 	}
 
 	const delay = DELIVERY_RETRY_DELAYS[Math.min(message.attempts, DELIVERY_RETRY_DELAYS.length) - 1];
-	console.log('delivery scheduled for retry', { domain, status, attempts: message.attempts, delaySeconds: delay, error: errorText ?? responseText });
+	console.log('delivery retry', { domain, status, attempts: message.attempts, delaySeconds: delay });
 	message.retry({ delaySeconds: delay });
 }
 
@@ -98,7 +97,7 @@ async function handleDeadLetter(env: Env, message: Message<DeliveryMessage>): Pr
 	}
 	await ignoreFailure(() => recordReceiverFailure(env.DB, hostOf(task.inboxUrl)));
 	await ignoreFailure(() => decrementPayload(env.DB, task.payloadId));
-	console.warn('delivery moved to dead-letter queue', { inbox: task.inboxUrl, profile: task.profile });
+	console.warn('delivery dead-lettered', { domain: hostOf(task.inboxUrl) });
 	message.ack();
 }
 

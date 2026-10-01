@@ -38,11 +38,15 @@ import { relayAnnounce, relayFollow, relayReply } from './builders';
 import { enqueueDeliveries, enqueueFanOut, enqueueToFollowers, enqueueToSubscribers } from './fanout';
 import type { RelayIdentity } from './identity';
 import { allowsPublicAddress, excludesPublicOnlyInCc } from './policy';
-import { fetchRemoteActor, fetchRemoteJson } from './remote';
+import { fetchRemoteActor, fetchRemoteJson, forceRefreshActor } from './remote';
 
 export interface InboundResponse {
 	status: number;
 	text?: string;
+	/** Short rejection reason for the single operational log line. */
+	reason?: string;
+	/** Host of the signing key, when one was presented. */
+	keyHost?: string;
 }
 
 interface InboundContext {
@@ -54,6 +58,8 @@ interface InboundContext {
 	actor: RemoteActor;
 	body: string;
 }
+
+type Verification = { ok: true; ctx: InboundContext } | { ok: false; reason: string; keyHost?: string };
 
 // ---------------------------------------------------------------------------
 // Verification
@@ -71,6 +77,17 @@ function parseActivity(body: string): APActivity | null {
 	}
 }
 
+/**
+ * Resolves the signer key, retrying once with a forced refresh. The refresh
+ * picks up key rotation and recovers from a stale negative cache entry.
+ */
+async function resolveSignerActor(env: Env, config: RelayConfig, identity: RelayIdentity, keyId: string): Promise<RemoteActor | null> {
+	const actor = await fetchRemoteActor(env, config, identity, keyId, keyId);
+	if (actor?.publicKeyPem) return actor;
+	const refreshed = await forceRefreshActor(env, config, identity, keyId, keyId);
+	return refreshed?.publicKeyPem ? refreshed : actor;
+}
+
 /** Legacy draft-cavage verification with actor/key host binding. */
 async function verifyLegacy(
 	env: Env,
@@ -80,34 +97,38 @@ async function verifyLegacy(
 	url: string,
 	headers: Record<string, string>,
 	body: string,
-): Promise<InboundContext | null> {
-	const fail = (reason: string): null => {
-		console.warn('legacy verification rejected', { reason });
-		return null;
-	};
+): Promise<Verification> {
 	const parsed = parseSignatureHeader(headers['signature'] ?? '');
-	if (!parsed?.keyId) return fail('missing keyId');
-	if (!headers['digest']) return fail('missing Digest header');
-	if (!(await digestHeaderMatches(headers['digest'], body))) return fail('Digest header does not match the body');
+	if (!parsed?.keyId) return { ok: false, reason: 'signature-missing' };
+	const keyHost = hostOf(parsed.keyId);
+	if (!headers['digest']) return { ok: false, reason: 'digest-missing', keyHost };
+	if (!(await digestHeaderMatches(headers['digest'], body))) return { ok: false, reason: 'digest-mismatch', keyHost };
 
-	const signerActor = await fetchRemoteActor(env, config, identity, parsed.keyId, parsed.keyId);
-	if (!signerActor?.publicKeyPem) return fail('unable to resolve the signer public key');
-	const verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: signerActor.publicKeyPem });
-	if (!verification.ok) return fail(verification.error ?? 'signature verification failed');
+	let signerActor = await resolveSignerActor(env, config, identity, parsed.keyId);
+	if (!signerActor?.publicKeyPem) return { ok: false, reason: 'key-unresolved', keyHost };
+	let verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: signerActor.publicKeyPem });
+	if (!verification.ok) {
+		const refreshed = await forceRefreshActor(env, config, identity, parsed.keyId, parsed.keyId);
+		if (refreshed?.publicKeyPem && refreshed.publicKeyPem !== signerActor.publicKeyPem) {
+			verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: refreshed.publicKeyPem });
+			if (verification.ok) signerActor = refreshed;
+		}
+		if (!verification.ok) return { ok: false, reason: 'signature-invalid', keyHost };
+	}
 
 	const activity = parseActivity(body);
-	if (!activity?.actor) return fail('malformed activity');
+	if (!activity?.actor) return { ok: false, reason: 'malformed-activity', keyHost };
 	const actorDomain = hostOf(activity.actor);
-	if (!actorDomain) return fail('activity actor has no hostname');
-	if (hostOf(parsed.keyId) !== actorDomain) return fail('signature key host does not match the activity actor');
-	if (hostOf(signerActor.id) !== actorDomain) return fail('signer actor host does not match the activity actor');
-	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== actorDomain) return fail('public key owner host does not match the activity actor');
+	if (!actorDomain) return { ok: false, reason: 'malformed-activity', keyHost };
+	if (hostOf(parsed.keyId) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
+	if (hostOf(signerActor.id) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
+	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
 
 	const actor = activity.actor === signerActor.id ? signerActor : await fetchRemoteActor(env, config, identity, activity.actor);
-	if (!actor || hostOf(actor.id) !== actorDomain) return fail('unable to resolve the activity actor document');
+	if (!actor || hostOf(actor.id) !== actorDomain) return { ok: false, reason: 'actor-unresolved', keyHost };
 
 	const settings = await loadSettings(env, config);
-	return { env, config, identity, settings, activity, actor, body };
+	return { ok: true, ctx: { env, config, identity, settings, activity, actor, body } };
 }
 
 /** RFC 9421 verification with nonce replay protection. */
@@ -119,41 +140,76 @@ async function verifyRfc9421(
 	url: string,
 	headers: Record<string, string>,
 	body: string,
-): Promise<InboundContext | null> {
-	const fail = (reason: string): null => {
-		console.warn('rfc9421 verification rejected', { reason });
-		return null;
-	};
+): Promise<Verification> {
 	const members = parseSignatureInput(headers['signature-input'] ?? '');
-	const tagged = members.filter((member) => member.params.tag === 'activitypub');
-	if (tagged.length !== 1) return fail('expected exactly one activitypub signature member');
-	const keyId = tagged[0].params.keyid;
-	if (!keyId) return fail('missing keyid');
+	if (members.length === 0) return { ok: false, reason: 'signature-missing' };
+	// Prefer `activitypub`-tagged members; bound the number of candidates so a
+	// multi-member header cannot amplify actor fetches.
+	const ordered = [...members.filter((member) => member.params.tag === 'activitypub'), ...members.filter((member) => member.params.tag !== 'activitypub')].slice(0, 2);
 
-	const signerActor = await fetchRemoteActor(env, config, identity, keyId, keyId);
-	if (!signerActor?.publicKeyPem) return fail('unable to resolve the signer public key');
-	const verification = await verifyRfc9421Signature({
-		method: request.method,
-		url,
-		headers,
-		body,
-		publicKeyPem: signerActor.publicKeyPem,
-		expectedAuthority: config.domain,
-	});
-	if (!verification.ok || !verification.keyId || !verification.nonce) return fail(verification.error ?? 'signature verification failed');
+	let reason = 'signature-missing';
+	let keyHost: string | undefined;
+	for (const member of ordered) {
+		const keyId = member.params.keyid;
+		if (!keyId) continue;
+		keyHost = hostOf(keyId);
 
-	const activity = parseActivity(body);
-	if (!activity?.actor) return fail('malformed activity');
-	if (signerActor.publicKeyId !== verification.keyId) return fail('public key id does not match the signature keyid');
-	if (signerActor.publicKeyOwner !== activity.actor) return fail('public key owner does not match the activity actor');
-	if (signerActor.id !== activity.actor) return fail('signer actor does not match the activity actor');
+		let signerActor = await resolveSignerActor(env, config, identity, keyId);
+		if (!signerActor?.publicKeyPem) {
+			reason = 'key-unresolved';
+			continue;
+		}
+		const verify = (publicKeyPem: string) =>
+			verifyRfc9421Signature({
+				method: request.method,
+				url,
+				headers,
+				body,
+				publicKeyPem,
+				expectedAuthority: config.domain,
+				label: member.label,
+			});
+		let verification = await verify(signerActor.publicKeyPem);
+		if (!verification.ok) {
+			const refreshed = await forceRefreshActor(env, config, identity, keyId, keyId);
+			if (refreshed?.publicKeyPem && refreshed.publicKeyPem !== signerActor.publicKeyPem) {
+				signerActor = refreshed;
+				verification = await verify(refreshed.publicKeyPem);
+			}
+			if (!verification.ok) {
+				reason = 'signature-invalid';
+				continue;
+			}
+		}
+		if (!verification.keyId) {
+			reason = 'signature-invalid';
+			continue;
+		}
 
-	// Reserve the nonce only after both the signature and the digest succeeded.
-	const nonceHash = await sha256Hex(`${verification.keyId}\u0000${verification.nonce}`);
-	if (!(await reserveNonce(env.DB, nonceHash))) return fail('replayed signature nonce');
+		const activity = parseActivity(body);
+		if (!activity?.actor) return { ok: false, reason: 'malformed-activity', keyHost };
+		if (signerActor.publicKeyId !== verification.keyId) {
+			reason = 'actor-binding';
+			continue;
+		}
+		if (signerActor.publicKeyOwner !== activity.actor || signerActor.id !== activity.actor) {
+			reason = 'actor-binding';
+			continue;
+		}
 
-	const settings = await loadSettings(env, config);
-	return { env, config, identity, settings, activity, actor: signerActor, body };
+		// Reserve the nonce only after both the signature and the digest succeeded.
+		if (verification.nonce) {
+			const nonceHash = await sha256Hex(`${verification.keyId}\u0000${verification.nonce}`);
+			if (!(await reserveNonce(env.DB, nonceHash))) {
+				reason = 'replay';
+				continue;
+			}
+		}
+
+		const settings = await loadSettings(env, config);
+		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body } };
+	}
+	return { ok: false, reason, keyHost };
 }
 
 async function loadSettings(env: Env, config: RelayConfig): Promise<RelaySettings> {
@@ -256,11 +312,11 @@ async function recordPublisherActivity(ctx: InboundContext): Promise<{ ok: boole
 
 async function executeRelayActivity(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked` };
+	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { status: 202 };
 
 	const publisher = await recordPublisherActivity(ctx);
-	if (!publisher.ok) return { status: 401, text: publisher.error };
+	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 
 	// Duplicate deliveries of the same activity must not fan out twice.
 	if (ctx.activity.id && !(await reserveActivity(ctx.env.DB, ctx.activity.id))) return { status: 202 };
@@ -288,12 +344,12 @@ async function executeRelayActivity(ctx: InboundContext): Promise<InboundRespons
 
 async function executeEmbeddedAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked` };
+	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { status: 202 };
 	const embeddedId = objectId(ctx.activity.object);
 	if (!embeddedId) return { status: 202 };
 	const publisher = await recordPublisherActivity(ctx);
-	if (!publisher.ok) return { status: 401, text: publisher.error };
+	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 	await enqueueFanOut(ctx.env, ctx.config, JSON.stringify(relayAnnounce(ctx.config, embeddedId)), [sourceDomain]);
 	return { status: 202 };
 }
@@ -301,16 +357,16 @@ async function executeEmbeddedAnnounce(ctx: InboundContext): Promise<InboundResp
 async function executePublicAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	if (shouldFanOutPublicAnnounce(ctx.activity)) return executeEmbeddedAnnounce(ctx);
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked` };
+	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	const publisher = await recordPublisherActivity(ctx);
-	if (!publisher.ok) return { status: 401, text: publisher.error };
+	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 	return { status: 202 };
 }
 
 async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
 	if (!(await isSubscriberOrFollower(ctx.env.DB, sourceDomain))) {
-		return { status: 401, text: 'to use the relay service, please follow in advance' };
+		return { status: 401, text: 'to use the relay service, please follow in advance', reason: 'not-subscribed' };
 	}
 	const referencedUrl = objectId(ctx.activity.object);
 	if (!referencedUrl) return { status: 202 };
@@ -323,7 +379,7 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 
 	const originDomain = hostOf(referenced.actor);
 	if (!originDomain) return { status: 202 };
-	if (await isBlocked(ctx.env.DB, originDomain)) return { status: 401, text: `${originDomain} is blocked` };
+	if (await isBlocked(ctx.env.DB, originDomain)) return { status: 401, text: `${originDomain} is blocked`, reason: 'blocked' };
 	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, referenced.actor);
 	if (!originActor || !(await isActorAbleToRelay(ctx, originActor))) return { status: 202 };
 	await recordPublisher(ctx.env.DB, {
@@ -336,7 +392,7 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 	const result = await enqueueFanOut(ctx.env, ctx.config, JSON.stringify(relayAnnounce(ctx.config, referenced.id)), [sourceDomain, originDomain]);
 	if (!result.ok) {
 		await releaseCanonical(ctx.env.DB, canonicalHash);
-		return { status: 401, text: `fan-out rejected: ${result.reason}` };
+		return { status: 401, text: `fan-out rejected: ${result.reason}`, reason: 'fanout' };
 	}
 	return { status: 202 };
 }
@@ -492,7 +548,7 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	if (excludesPublicOnlyInCc(to, cc, policy)) {
 		if (['Create', 'Update', 'Delete', 'Move', 'Announce'].includes(ctx.activity.type)) {
 			const publisher = await recordPublisherActivity(ctx);
-			if (!publisher.ok) return { status: 401, text: publisher.error };
+			if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 		}
 		return { status: 202 };
 	}
@@ -520,9 +576,9 @@ export async function processInboundActivity(env: Env, config: RelayConfig, iden
 	headers['host'] = url.host;
 
 	const usesRfc9421 = request.headers.has('signature-input');
-	const ctx = usesRfc9421
+	const verification = usesRfc9421
 		? await verifyRfc9421(env, config, identity, request, url.toString(), headers, body)
 		: await verifyLegacy(env, config, identity, request, url.toString(), headers, body);
-	if (!ctx) return { status: 400 };
-	return dispatchInbound(ctx);
+	if (!verification.ok) return { status: 400, reason: verification.reason, keyHost: verification.keyHost };
+	return dispatchInbound(verification.ctx);
 }

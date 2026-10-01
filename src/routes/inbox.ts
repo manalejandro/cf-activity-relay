@@ -17,17 +17,13 @@ export async function handleInbox(env: Env, config: RelayConfig, request: Reques
 		case 'POST': {
 			const body = await readBodyBounded(request, config.maxActivityBytes);
 			if (body === null) {
-				console.warn('rejected inbox activity: body exceeds MAX_ACTIVITY_BYTES', { limit: config.maxActivityBytes });
+				console.warn('inbox rejected', { status: 400, reason: 'body-too-large' });
 				return textResponse('', 400);
 			}
 			const identity = await getRelayIdentity(env, config);
 			const result = await processInboundActivity(env, config, identity, request, body);
 			if (result.status >= 400) {
-				console.warn('rejected inbox activity', {
-					status: result.status,
-					userAgent: request.headers.get('user-agent')?.slice(0, 256) ?? '',
-					reason: result.text?.slice(0, 512) ?? 'verification failed',
-				});
+				console.warn('inbox rejected', { status: result.status, reason: result.reason ?? 'processing', keyHost: result.keyHost });
 			}
 			return textResponse(result.text ?? '', result.status);
 		}

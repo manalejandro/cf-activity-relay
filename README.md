@@ -20,7 +20,7 @@ It implements the same federation model as the Go [Activity-Relay](https://githu
   - Follower-style: `Follow` addressed to the relay actor (Pleroma, Akkoma, Friendica, NodeBB, …) with a reciprocal `Follow` and mutual-follow tracking.
 - **HTTP signatures, both generations**
   - Legacy Fediverse profile (`Signature: keyId="…",algorithm="rsa-sha256",headers="…"`).
-  - RFC 9421 HTTP Message Signatures with RFC 9530 `Content-Digest`, `nonce` replay protection and `activitypub` tag validation.
+  - RFC 9421 HTTP Message Signatures with RFC 9530 `Content-Digest` and `nonce` replay protection. The verifier follows Mastodon's rule set — `@method`, `@target-uri` and `content-digest` must be covered — while preferring and fully supporting the Fediverse `tag="activitypub"` profile.
 - **Destination-aware outbound signing** (`OUTBOUND_SIGNATURE_PROFILE`)
   - `dual` (default): unknown fetches probe RFC 9421 with one legacy fallback after an explicit signature challenge; unknown deliveries use legacy; capability evidence is cached per origin and scope.
   - `legacy` and `rfc9421` pin a single wire profile.
@@ -36,14 +36,14 @@ It implements the same federation model as the Go [Activity-Relay](https://githu
 ## Architecture
 
 ```
-                        ┌───────────────────────────────────────────────┐
-   federation traffic   │              Cloudflare Worker                │
-  ─────────────────────▶│                                               │
-   POST /inbox          │  router ─▶ /inbox  ─▶ verify ─▶ dispatch      │
-   GET  /actor          │            /actor  ─▶ actor document          │
+                        ┌────────────────────────────────────────────────┐
+   federation traffic   │              Cloudflare Worker                 │
+  ─────────────────────▶│                                                │
+   POST /inbox          │  router ─▶ /inbox  ─▶ verify ─▶ dispatch       │
+   GET  /actor          │            /actor  ─▶ actor document           │
    GET  /status.json    │            /status.json ─▶ D1 aggregation      │
                         │            /.well-known/* ─▶ WebFinger/NodeInfo│
-                        └───────┬───────────────┬───────────────┬───────┘
+                        └───────┬───────────────┬───────────────┬────────┘
                                 │               │               │
                         ┌───────▼──────┐ ┌──────▼──────┐ ┌──────▼────────┐
                         │  D1          │ │  KV         │ │  Queues       │
@@ -51,8 +51,8 @@ It implements the same federation model as the Go [Activity-Relay](https://githu
                         │  payloads    │ │  cache      │ │  retries      │
                         │  keys        │ │  capability │ │  DLQ          │
                         └──────────────┘ └─────────────┘ └──────┬────────┘
-                                                                 │ signed POST
-                                                                 ▼
+                                                                │ signed POST
+                                                                ▼
                                                         remote shared inboxes
 ```
 
@@ -214,9 +214,9 @@ Receiver health (`last_success_at`, `last_failure_at`, `consecutive_failures`, `
 
 1. Body is read with a hard `MAX_ACTIVITY_BYTES` limit.
 2. The signature profile is selected by the presence of `Signature-Input`: RFC 9421 or legacy.
-3. The signer actor is resolved through KV or a **signed** remote `GET`; signature, digest and `Date`/`created` windows are verified.
+3. The signer actor is resolved through KV or a **signed** remote `GET`; signature, digest and `Date`/`created` windows are verified. When the key is missing or the signature fails, the actor is re-fetched once (throttled) to pick up key rotation and recover from stale cache entries.
 4. Actor/key host binding is enforced: the signature key, the activity actor and the actor document must share a hostname (canonical URL equality for RFC 9421).
-5. RFC 9421 nonces are reserved in D1 **after** cryptographic verification, so replays are rejected without allowing unsigned traffic to consume nonces.
+5. RFC 9421 nonces are reserved in D1 **after** cryptographic verification, so replays are rejected without allowing unsigned traffic to consume nonces. Members tagged `activitypub` are preferred; untagged members are accepted so Mastodon's minimal fallback signature verifies.
 6. The activity is dispatched by audience:
    - `to`/`cc` contains the Public collection → fan-out path (`Create`, `Update`, `Delete`, `Move`, `Announce`).
    - `to`/`cc` addresses the relay or a known follower's `/followers` → subscription path (`Follow`, `Undo`, `Accept`, `Reject`, `Announce`).

@@ -13,8 +13,17 @@ export const RFC9421_SIGNATURE_LABEL = 'activitypub';
 export const RFC9421_SIGNATURE_TAG = 'activitypub';
 export const RFC9421_ALGORITHM = 'rsa-v1_5-sha256';
 
-/** Components required on an inbound POST signature. */
-export const RFC9421_REQUIRED_POST_COMPONENTS = ['@method', '@authority', '@target-uri', 'content-digest', 'content-type', 'date'] as const;
+/**
+ * Components every inbound POST signature must cover.
+ *
+ * This is the Mastodon verification rule set (`SignedRequest`): the derived
+ * `@method` and `@target-uri` components plus `content-digest` for POST. The
+ * Fediverse RFC 9421 profile also signs `@authority`, `content-type` and
+ * `date`, but those are optional here so that senders which emit the minimal
+ * component set are still accepted. Every component a sender *does* cover is
+ * always included in the signing base.
+ */
+export const RFC9421_REQUIRED_POST_COMPONENTS = ['@method', '@target-uri', 'content-digest'] as const;
 
 const MAX_CREATED_AGE_SECONDS = 300;
 const MAX_CREATED_SKEW_SECONDS = 30;
@@ -192,6 +201,8 @@ export interface Rfc9421VerificationInput {
 	body: string;
 	publicKeyPem: string;
 	expectedAuthority?: string;
+	/** Restricts verification to a single `Signature-Input` member label. */
+	label?: string;
 }
 
 export interface Rfc9421VerificationResult {
@@ -205,16 +216,53 @@ export interface Rfc9421VerificationResult {
 export async function verifyRfc9421Signature(input: Rfc9421VerificationInput): Promise<Rfc9421VerificationResult> {
 	if (input.method.toUpperCase() !== 'POST') return { ok: false, error: 'RFC 9421 verification only supports POST' };
 	const members = parseSignatureInput(input.headers['signature-input'] ?? '');
+	if (members.length === 0) return { ok: false, error: 'no signature members found' };
+
+	const url = new URL(input.url);
+	url.hash = '';
+	if (input.expectedAuthority && url.host !== input.expectedAuthority) {
+		return { ok: false, error: 'request authority does not match the relay hostname' };
+	}
+	if (!(await contentDigestMatches(input.headers['content-digest'] ?? '', input.body))) {
+		return { ok: false, error: 'Content-Digest does not match the request body' };
+	}
+
+	let key: CryptoKey;
+	try {
+		key = await importPublicKey(input.publicKeyPem);
+	} catch {
+		return { ok: false, error: 'unable to parse the actor public key' };
+	}
+
+	// Prefer the Fediverse `activitypub` tag, but accept untagged members:
+	// Mastodon signs a minimal component set without a tag and falls back to
+	// RFC 9421 after a failed draft-cavage attempt.
 	const tagged = members.filter((member) => member.params.tag === RFC9421_SIGNATURE_TAG);
-	if (tagged.length === 0) return { ok: false, error: 'no activitypub signature member found' };
-	if (tagged.length > 1) return { ok: false, error: 'multiple activitypub signature members found' };
-	const member = tagged[0];
+	const candidates = input.label ? members.filter((member) => member.label === input.label) : tagged.length > 0 ? tagged : members;
+	if (candidates.length === 0) return { ok: false, error: `no signature member with label ${input.label}` };
+	let lastError = 'signature verification failed';
+
+	for (const member of candidates) {
+		const verified = await verifySignatureMember(input, member, url, key);
+		if (verified.ok) return verified;
+		lastError = verified.error ?? lastError;
+	}
+	return { ok: false, error: lastError };
+}
+
+/** Verifies a single `Signature-Input` member against the request. */
+async function verifySignatureMember(
+	input: Rfc9421VerificationInput,
+	member: ParsedSignatureMember,
+	url: URL,
+	key: CryptoKey,
+): Promise<Rfc9421VerificationResult> {
 	const { keyid, nonce, created, expires, alg } = member.params;
 	if (!keyid) return { ok: false, error: 'signature is missing keyid' };
-	if (!alg || alg !== RFC9421_ALGORITHM) return { ok: false, error: `unsupported signature algorithm: ${alg ?? 'absent'}` };
-	if (!nonce) return { ok: false, error: 'signature is missing nonce' };
-	if (nonce.length > 256) return { ok: false, error: 'signature nonce is too long' };
+	if (alg && alg !== RFC9421_ALGORITHM) return { ok: false, error: `unsupported signature algorithm: ${alg}` };
 	if (!created) return { ok: false, error: 'signature is missing created' };
+	if (nonce && nonce.length > 256) return { ok: false, error: 'signature nonce is too long' };
+
 	const createdSeconds = Number(created);
 	const nowSeconds = Math.floor(Date.now() / 1000);
 	if (!Number.isFinite(createdSeconds)) return { ok: false, error: 'signature created is not numeric' };
@@ -235,22 +283,12 @@ export async function verifyRfc9421Signature(input: Rfc9421VerificationInput): P
 		if (!seen.has(required)) return { ok: false, error: `signature is missing required component: ${required}` };
 	}
 
-	if (!(await contentDigestMatches(input.headers['content-digest'] ?? '', input.body))) {
-		return { ok: false, error: 'Content-Digest does not match the request body' };
-	}
-
-	const url = new URL(input.url);
-	url.hash = '';
-	const authority = input.expectedAuthority ?? url.host;
-	if (input.expectedAuthority && url.host !== input.expectedAuthority) {
-		return { ok: false, error: 'request authority does not match the relay hostname' };
-	}
 	let signingString: string;
 	try {
 		signingString = buildSigningString(member.components, {
 			method: input.method,
 			targetUri: url.toString(),
-			authority,
+			authority: url.host,
 			headers: input.headers,
 			paramsString: member.paramsString,
 		});
@@ -260,12 +298,6 @@ export async function verifyRfc9421Signature(input: Rfc9421VerificationInput): P
 
 	const signatureValue = extractSignatureValue(input.headers['signature'] ?? '', member.label);
 	if (!signatureValue) return { ok: false, error: 'missing or malformed Signature header' };
-	let key: CryptoKey;
-	try {
-		key = await importPublicKey(input.publicKeyPem);
-	} catch {
-		return { ok: false, error: 'unable to parse the actor public key' };
-	}
 	const valid = await crypto.subtle.verify(RSA_ALGORITHM, key, base64ToBytes(signatureValue), utf8(signingString));
 	if (!valid) return { ok: false, error: 'signature verification failed' };
 	return { ok: true, keyId: keyid, nonce };
