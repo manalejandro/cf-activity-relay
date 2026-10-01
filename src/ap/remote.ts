@@ -201,6 +201,26 @@ export async function fetchRemoteActor(env: Env, config: RelayConfig, identity: 
 	const parsed = parseHttpUrl(cleaned);
 	if (!parsed || isPrivateHost(parsed.hostname)) return null;
 
+	// The relay's own actor is resolved locally. A Worker subrequest to its own
+	// hostname can deadlock and time out (HTTP 522), and there is no reason to
+	// spend a network round trip on data the relay already owns.
+	if (hostOf(cleaned) === config.domain) {
+		if (cleaned !== config.actorId) return null;
+		const { buildRelayActor } = await import('./actor');
+		const raw = await buildRelayActor(env, config);
+		return {
+			id: config.actorId,
+			type: 'Application',
+			inbox: `${config.baseUrl}/inbox`,
+			sharedInbox: `${config.baseUrl}/inbox`,
+			preferredUsername: 'relay',
+			publicKeyId: config.keyId,
+			publicKeyPem: identity.publicKeyPem,
+			publicKeyOwner: config.actorId,
+			raw,
+		};
+	}
+
 	const cacheKey = `actor:${cleaned}`;
 	const cached = await env.CACHE.get<RemoteActor>(cacheKey, 'json');
 	if (cached) return withResolvedKey(cached, keyId);
@@ -280,6 +300,8 @@ export async function invalidateRemoteActor(env: Env, actorUrl: string): Promise
 export async function fetchRemoteJson(env: Env, config: RelayConfig, identity: RelayIdentity, url: string): Promise<Record<string, unknown> | null> {
 	const parsed = parseHttpUrl(url);
 	if (!parsed || isPrivateHost(parsed.hostname)) return null;
+	// Never subrequest the relay's own hostname; see `fetchRemoteActor`.
+	if (hostOf(url) === config.domain) return null;
 	try {
 		const { response } = await signedFetch(env, config, identity, url, { method: 'GET', scope: 'fetch' });
 		if (!response.ok) {

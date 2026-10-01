@@ -259,6 +259,7 @@ The suite runs inside `workerd` with the Cloudflare Vitest plugin and covers:
 ## Security notes
 
 - Delivery targets and actor URLs are validated; loopback and private IP literals are refused.
+- The relay's own actor is resolved from local state. A Worker subrequest to the relay's own hostname can deadlock and time out, so self-host fetches are never attempted.
 - Remote documents are read with hard byte limits, and redirects must stay on the same host.
 - POST signatures must cover the `Digest`/`Content-Digest`, binding the body to the signature.
 - `/status.json` never exposes inbox URLs, actor IDs, blocked-domain lists or queue internals.

@@ -72,41 +72,66 @@ function parseActivity(body: string): APActivity | null {
 }
 
 /** Legacy draft-cavage verification with actor/key host binding. */
-async function verifyLegacy(env: Env, config: RelayConfig, identity: RelayIdentity, request: Request, url: string, headers: Record<string, string>, body: string): Promise<InboundContext | null> {
+async function verifyLegacy(
+	env: Env,
+	config: RelayConfig,
+	identity: RelayIdentity,
+	request: Request,
+	url: string,
+	headers: Record<string, string>,
+	body: string,
+): Promise<InboundContext | null> {
+	const fail = (reason: string): null => {
+		console.warn('legacy verification rejected', { reason });
+		return null;
+	};
 	const parsed = parseSignatureHeader(headers['signature'] ?? '');
-	if (!parsed?.keyId) return null;
-	if (!headers['digest'] || !(await digestHeaderMatches(headers['digest'], body))) return null;
+	if (!parsed?.keyId) return fail('missing keyId');
+	if (!headers['digest']) return fail('missing Digest header');
+	if (!(await digestHeaderMatches(headers['digest'], body))) return fail('Digest header does not match the body');
 
 	const signerActor = await fetchRemoteActor(env, config, identity, parsed.keyId, parsed.keyId);
-	if (!signerActor?.publicKeyPem) return null;
+	if (!signerActor?.publicKeyPem) return fail('unable to resolve the signer public key');
 	const verification = await verifyLegacySignature({ method: request.method, url, headers, body, publicKeyPem: signerActor.publicKeyPem });
-	if (!verification.ok) return null;
+	if (!verification.ok) return fail(verification.error ?? 'signature verification failed');
 
 	const activity = parseActivity(body);
-	if (!activity?.actor) return null;
+	if (!activity?.actor) return fail('malformed activity');
 	const actorDomain = hostOf(activity.actor);
-	if (!actorDomain) return null;
-	if (hostOf(parsed.keyId) !== actorDomain) return null;
-	if (hostOf(signerActor.id) !== actorDomain) return null;
-	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== actorDomain) return null;
+	if (!actorDomain) return fail('activity actor has no hostname');
+	if (hostOf(parsed.keyId) !== actorDomain) return fail('signature key host does not match the activity actor');
+	if (hostOf(signerActor.id) !== actorDomain) return fail('signer actor host does not match the activity actor');
+	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== actorDomain) return fail('public key owner host does not match the activity actor');
 
 	const actor = activity.actor === signerActor.id ? signerActor : await fetchRemoteActor(env, config, identity, activity.actor);
-	if (!actor || hostOf(actor.id) !== actorDomain) return null;
+	if (!actor || hostOf(actor.id) !== actorDomain) return fail('unable to resolve the activity actor document');
 
 	const settings = await loadSettings(env, config);
 	return { env, config, identity, settings, activity, actor, body };
 }
 
 /** RFC 9421 verification with nonce replay protection. */
-async function verifyRfc9421(env: Env, config: RelayConfig, identity: RelayIdentity, request: Request, url: string, headers: Record<string, string>, body: string): Promise<InboundContext | null> {
+async function verifyRfc9421(
+	env: Env,
+	config: RelayConfig,
+	identity: RelayIdentity,
+	request: Request,
+	url: string,
+	headers: Record<string, string>,
+	body: string,
+): Promise<InboundContext | null> {
+	const fail = (reason: string): null => {
+		console.warn('rfc9421 verification rejected', { reason });
+		return null;
+	};
 	const members = parseSignatureInput(headers['signature-input'] ?? '');
 	const tagged = members.filter((member) => member.params.tag === 'activitypub');
-	if (tagged.length !== 1) return null;
+	if (tagged.length !== 1) return fail('expected exactly one activitypub signature member');
 	const keyId = tagged[0].params.keyid;
-	if (!keyId) return null;
+	if (!keyId) return fail('missing keyid');
 
 	const signerActor = await fetchRemoteActor(env, config, identity, keyId, keyId);
-	if (!signerActor?.publicKeyPem) return null;
+	if (!signerActor?.publicKeyPem) return fail('unable to resolve the signer public key');
 	const verification = await verifyRfc9421Signature({
 		method: request.method,
 		url,
@@ -115,17 +140,17 @@ async function verifyRfc9421(env: Env, config: RelayConfig, identity: RelayIdent
 		publicKeyPem: signerActor.publicKeyPem,
 		expectedAuthority: config.domain,
 	});
-	if (!verification.ok || !verification.keyId || !verification.nonce) return null;
+	if (!verification.ok || !verification.keyId || !verification.nonce) return fail(verification.error ?? 'signature verification failed');
 
 	const activity = parseActivity(body);
-	if (!activity?.actor) return null;
-	if (signerActor.publicKeyId !== verification.keyId) return null;
-	if (signerActor.publicKeyOwner !== activity.actor) return null;
-	if (signerActor.id !== activity.actor) return null;
+	if (!activity?.actor) return fail('malformed activity');
+	if (signerActor.publicKeyId !== verification.keyId) return fail('public key id does not match the signature keyid');
+	if (signerActor.publicKeyOwner !== activity.actor) return fail('public key owner does not match the activity actor');
+	if (signerActor.id !== activity.actor) return fail('signer actor does not match the activity actor');
 
 	// Reserve the nonce only after both the signature and the digest succeeded.
 	const nonceHash = await sha256Hex(`${verification.keyId}\u0000${verification.nonce}`);
-	if (!(await reserveNonce(env.DB, nonceHash))) return null;
+	if (!(await reserveNonce(env.DB, nonceHash))) return fail('replayed signature nonce');
 
 	const settings = await loadSettings(env, config);
 	return { env, config, identity, settings, activity, actor: signerActor, body };
@@ -323,6 +348,12 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 		await sendReply(ctx, 'Reject', inbox);
 		return { status: 202 };
 	}
+	// A relay must never subscribe to itself: a self-referential receiver would
+	// re-enter the fan-out path and could loop on relay-authored wrappers.
+	if (actorDomain === ctx.config.domain) {
+		await sendReply(ctx, 'Reject', inbox);
+		return { status: 202 };
+	}
 	const objectValues = asStringArray(ctx.activity.object);
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
 		if (ctx.settings.manuallyAccept) {
@@ -379,9 +410,9 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 	return { status: 202 };
 }
 
-async function executeUnfollowing(ctx: InboundContext): Promise<InboundResponse> {
+async function executeUnfollowing(ctx: InboundContext, innerFollow: Record<string, unknown>): Promise<InboundResponse> {
 	const actorDomain = hostOf(ctx.actor.id);
-	const objectValues = asStringArray(ctx.activity.object);
+	const objectValues = asStringArray(innerFollow.object);
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
 		await deleteSubscriber(ctx.env.DB, actorDomain);
 		await deletePending(ctx.env.DB, actorDomain);
@@ -394,6 +425,12 @@ async function executeUnfollowing(ctx: InboundContext): Promise<InboundResponse>
 	}
 	await sendReply(ctx, 'Reject', ctx.actor.inbox ?? ctx.actor.sharedInbox);
 	return { status: 202 };
+}
+
+/** Unwraps an `Undo{Follow}`; returns null when the inner activity is not a Follow. */
+function unwrapInnerFollow(object: unknown): Record<string, unknown> | null {
+	if (!isEmbeddedObject(object) || object.type !== 'Follow') return null;
+	return object;
 }
 
 async function finalizeMutuallyFollow(ctx: InboundContext): Promise<InboundResponse> {
@@ -438,8 +475,10 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 		switch (ctx.activity.type) {
 			case 'Follow':
 				return executeFollowing(ctx);
-			case 'Undo':
-				return isEmbeddedObject(ctx.activity.object) && ctx.activity.object.type === 'Follow' ? executeUnfollowing(ctx) : { status: 202 };
+			case 'Undo': {
+				const innerFollow = unwrapInnerFollow(ctx.activity.object);
+				return innerFollow ? executeUnfollowing(ctx, innerFollow) : { status: 202 };
+			}
 			case 'Accept':
 			case 'Reject':
 				return finalizeMutuallyFollow(ctx);
@@ -461,8 +500,10 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	switch (ctx.activity.type) {
 		case 'Follow':
 			return executeFollowing(ctx);
-		case 'Undo':
-			return isEmbeddedObject(ctx.activity.object) && ctx.activity.object.type === 'Follow' ? executeUnfollowing(ctx) : { status: 202 };
+		case 'Undo': {
+			const innerFollow = unwrapInnerFollow(ctx.activity.object);
+			return innerFollow ? executeUnfollowing(ctx, innerFollow) : { status: 202 };
+		}
 		default:
 			return { status: 202 };
 	}

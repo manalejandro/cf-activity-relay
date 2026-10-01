@@ -97,6 +97,46 @@ describe('inbound inbox processing', () => {
 		expect(response.status).toBe(400);
 	});
 
+	it('removes a subscriber on Undo{Follow}', async () => {
+		stubFederation();
+		const followBody = followActivity('https://remote.example/activities/follow-undo');
+		const signedFollow = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: followBody, privateKeyPem, keyId: REMOTE_KEY });
+		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedFollow, body: followBody });
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeTruthy();
+
+		const undoBody = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/undo-follow',
+			type: 'Undo',
+			actor: REMOTE_ACTOR,
+			object: JSON.parse(followBody),
+		});
+		const signedUndo = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: undoBody, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedUndo, body: undoBody });
+		expect(response.status).toBe(202);
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
+	});
+
+	it('resolves its own actor locally and refuses self-subscription', async () => {
+		// No federation fetch is stubbed: the relay actor must be resolved from
+		// local state instead of a Worker subrequest to its own hostname.
+		const { loadConfig } = await import('../src/config');
+		const { getRelayIdentity } = await import('../src/ap/identity');
+		const config = loadConfig(env as unknown as Parameters<typeof loadConfig>[0]);
+		const identity = await getRelayIdentity(env as unknown as Parameters<typeof getRelayIdentity>[0], config);
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: `${config.actorId}/activities/self-follow`,
+			type: 'Follow',
+			actor: config.actorId,
+			object: PUBLIC_ADDRESS,
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem: identity.privateKeyPem, keyId: identity.keyId });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('relay.manalejandro.com').first()).toBeFalsy();
+	});
+
 	it('does not fan out an activity that is only public in cc', async () => {
 		stubFederation();
 		const body = JSON.stringify({
