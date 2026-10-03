@@ -251,6 +251,45 @@ describe('inbound inbox processing', () => {
 		expect(response.status).toBe(400);
 	});
 
+	it('relays a public Delete as a relay-authored Announce', async () => {
+		// Mirrors the reference `relay_activity_wrapper_test.go` case: an
+		// unsigned public Delete is wrapped in a relay-signed Announce that
+		// targets the relay followers, and the source body is never forwarded.
+		stubFederation();
+		await env.DB.prepare(
+			`INSERT INTO subscribers (domain, inbox_url, activity_id, actor_id, created_at) VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(domain) DO NOTHING`,
+		)
+			.bind('receiver.example', 'https://receiver.example/inbox', 'https://receiver.example/activities/follow', 'https://receiver.example/actor', new Date().toISOString())
+			.run();
+
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/delete-1',
+			type: 'Delete',
+			actor: REMOTE_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: { id: 'https://remote.example/notes/3', type: 'Tombstone' },
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		const payload = await env.DB.prepare('SELECT body FROM activity_payloads WHERE body LIKE ? ORDER BY created_at DESC LIMIT 1')
+			.bind('%notes/3%')
+			.first<{ body: string }>();
+		expect(payload).toBeTruthy();
+		const announce = JSON.parse(payload?.body ?? '{}') as Record<string, unknown>;
+		expect(announce.type).toBe('Announce');
+		expect(announce.actor).toBe(`${RELAY}/actor`);
+		expect(announce.object).toBe('https://remote.example/notes/3');
+		expect(announce.to).toEqual([`${RELAY}/actor/followers`]);
+		expect(payload?.body).not.toContain('Tombstone');
+
+		const publisher = await env.DB.prepare('SELECT last_activity_type FROM publishers WHERE domain = ?').bind('remote.example').first<{ last_activity_type: string }>();
+		expect(publisher?.last_activity_type).toBe('Delete');
+	});
+
 	it('does not fan out an activity that is only public in cc', async () => {
 		stubFederation();
 		const body = JSON.stringify({
