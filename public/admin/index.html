@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Relay administration — cf-activity-relay</title>
+		<meta name="robots" content="noindex, nofollow" />
+		<link rel="icon" href="/logo.svg" type="image/svg+xml" />
+		<style>
+			:root {
+				--bg: #0b0a1c;
+				--panel: #15142c;
+				--panel-2: #1c1b38;
+				--border: #2e2c56;
+				--border-soft: #262449;
+				--text: #eef2ff;
+				--muted: #b6bbd6;
+				--faint: #8b90b4;
+				--accent: #67e8f9;
+				--accent-2: #a5b4fc;
+				--ok: #4ade80;
+				--warn: #fbbf24;
+				--danger: #f87171;
+				--radius: 18px;
+				--shadow: 0 18px 50px rgba(4, 3, 18, 0.55);
+			}
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				min-height: 100vh;
+				background:
+					radial-gradient(1100px 520px at 12% -12%, rgba(67, 56, 202, 0.42), transparent 62%),
+					radial-gradient(900px 480px at 92% -6%, rgba(8, 145, 178, 0.32), transparent 58%), var(--bg);
+				color: var(--text);
+				font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+				font-size: 16px;
+				line-height: 1.65;
+			}
+			a {
+				color: var(--accent);
+				text-decoration-color: rgba(103, 232, 249, 0.4);
+				text-underline-offset: 3px;
+			}
+			:focus-visible {
+				outline: 2px solid var(--accent);
+				outline-offset: 2px;
+				border-radius: 6px;
+			}
+			[hidden] {
+				display: none !important;
+			}
+			.wrap {
+				width: 100%;
+				max-width: 1180px;
+				margin: 0 auto;
+				padding: 30px 24px 80px;
+			}
+
+			/* ---------------------------------------------------------- header */
+			.site-header {
+				display: flex;
+				align-items: center;
+				gap: 18px;
+				flex-wrap: wrap;
+				padding-bottom: 22px;
+				border-bottom: 1px solid var(--border-soft);
+			}
+			.site-header img {
+				width: 52px;
+				height: 52px;
+				border-radius: 14px;
+				box-shadow: 0 12px 34px rgba(34, 211, 238, 0.22);
+				flex: none;
+			}
+			.brand h1 {
+				margin: 0;
+				font-size: clamp(1.25rem, 3vw, 1.6rem);
+				letter-spacing: -0.02em;
+				line-height: 1.25;
+			}
+			.brand p {
+				margin: 2px 0 0;
+				color: var(--muted);
+				font-size: 0.9rem;
+			}
+			.header-actions {
+				margin-left: auto;
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				flex-wrap: wrap;
+			}
+
+			/* --------------------------------------------------------- buttons */
+			.button {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				gap: 8px;
+				border-radius: 999px;
+				padding: 9px 18px;
+				font-size: 0.88rem;
+				font-weight: 600;
+				font-family: inherit;
+				border: 1px solid var(--border);
+				background: rgba(255, 255, 255, 0.04);
+				color: var(--text);
+				cursor: pointer;
+				text-decoration: none;
+				transition: border-color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+				white-space: nowrap;
+			}
+			.button:hover:not(:disabled) {
+				border-color: var(--accent-2);
+				background: rgba(165, 180, 252, 0.1);
+			}
+			.button:disabled {
+				opacity: 0.5;
+				cursor: not-allowed;
+			}
+			.button.primary {
+				background: linear-gradient(180deg, rgba(103, 232, 249, 0.22), rgba(103, 232, 249, 0.1));
+				border-color: rgba(103, 232, 249, 0.45);
+				color: #dffaff;
+			}
+			.button.primary:hover:not(:disabled) {
+				background: linear-gradient(180deg, rgba(103, 232, 249, 0.3), rgba(103, 232, 249, 0.16));
+			}
+			.button.small {
+				padding: 5px 12px;
+				font-size: 0.8rem;
+			}
+			.button.danger {
+				border-color: rgba(248, 113, 113, 0.4);
+				color: #fecaca;
+			}
+			.button.danger:hover:not(:disabled) {
+				background: rgba(248, 113, 113, 0.12);
+				border-color: rgba(248, 113, 113, 0.7);
+			}
+
+			/* ---------------------------------------------------------- inputs */
+			input[type='text'],
+			input[type='password'],
+			input[type='url'],
+			select {
+				width: 100%;
+				padding: 10px 13px;
+				border-radius: 11px;
+				border: 1px solid var(--border);
+				background: var(--panel-2);
+				color: var(--text);
+				font-family: inherit;
+				font-size: 0.92rem;
+			}
+			input::placeholder {
+				color: var(--faint);
+			}
+			input:focus,
+			select:focus {
+				border-color: var(--accent);
+			}
+			label {
+				display: block;
+				font-size: 0.82rem;
+				font-weight: 600;
+				color: var(--muted);
+				margin-bottom: 6px;
+			}
+			.field {
+				display: flex;
+				gap: 10px;
+				align-items: flex-end;
+				flex-wrap: wrap;
+			}
+			.field > .grow {
+				flex: 1 1 260px;
+				min-width: 0;
+			}
+			.hint {
+				margin: 10px 0 0;
+				color: var(--faint);
+				font-size: 0.84rem;
+			}
+
+			/* ----------------------------------------------------------- cards */
+			.card {
+				background: var(--panel);
+				border: 1px solid var(--border);
+				border-radius: var(--radius);
+				padding: 24px 26px;
+				box-shadow: var(--shadow);
+				margin-top: 22px;
+			}
+			.card > h2 {
+				margin: 0 0 6px;
+				font-size: 1.02rem;
+				letter-spacing: -0.01em;
+			}
+			.card > .card-sub {
+				margin: 0 0 18px;
+				color: var(--faint);
+				font-size: 0.86rem;
+			}
+
+			/* ----------------------------------------------------------- login */
+			.login-shell {
+				display: grid;
+				place-items: center;
+				padding: 60px 0 20px;
+			}
+			.login {
+				width: 100%;
+				max-width: 460px;
+				background: var(--panel);
+				border: 1px solid var(--border);
+				border-radius: var(--radius);
+				padding: 32px;
+				box-shadow: var(--shadow);
+			}
+			.login h2 {
+				margin: 0 0 6px;
+				font-size: 1.35rem;
+				letter-spacing: -0.02em;
+			}
+			.login p {
+				margin: 0 0 20px;
+				color: var(--muted);
+				font-size: 0.92rem;
+			}
+			.login .button {
+				width: 100%;
+				margin-top: 16px;
+			}
+
+			/* ----------------------------------------------------------- stats */
+			.stats {
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+				gap: 14px;
+				margin-top: 22px;
+			}
+			.stat {
+				background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0)), var(--panel);
+				border: 1px solid var(--border);
+				border-radius: 14px;
+				padding: 16px 18px;
+			}
+			.stat dt {
+				margin: 0;
+				color: var(--faint);
+				font-size: 0.72rem;
+				font-weight: 700;
+				text-transform: uppercase;
+				letter-spacing: 0.09em;
+			}
+			.stat dd {
+				margin: 4px 0 0;
+				font-size: 1.7rem;
+				font-weight: 700;
+				letter-spacing: -0.02em;
+				line-height: 1.15;
+			}
+
+			/* ---------------------------------------------------------- tables */
+			.table-scroll {
+				overflow-x: auto;
+				border: 1px solid var(--border-soft);
+				border-radius: 13px;
+			}
+			table {
+				width: 100%;
+				border-collapse: collapse;
+				font-size: 0.88rem;
+			}
+			th,
+			td {
+				text-align: left;
+				padding: 10px 14px;
+				border-bottom: 1px solid var(--border-soft);
+				vertical-align: top;
+			}
+			th {
+				background: rgba(255, 255, 255, 0.035);
+				color: var(--faint);
+				font-size: 0.72rem;
+				font-weight: 700;
+				text-transform: uppercase;
+				letter-spacing: 0.08em;
+				white-space: nowrap;
+			}
+			tbody tr:last-child td {
+				border-bottom: none;
+			}
+			tbody tr:hover td {
+				background: rgba(255, 255, 255, 0.02);
+			}
+			td.mono,
+			th.mono {
+				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+				font-size: 0.82rem;
+				overflow-wrap: anywhere;
+			}
+			td.actions {
+				white-space: nowrap;
+				text-align: right;
+			}
+			.empty {
+				color: var(--faint);
+				font-style: italic;
+				padding: 14px 4px;
+				margin: 0;
+			}
+			.pill {
+				display: inline-block;
+				border-radius: 999px;
+				padding: 2px 9px;
+				font-size: 0.74rem;
+				font-weight: 700;
+				letter-spacing: 0.02em;
+				border: 1px solid var(--border);
+				background: var(--panel-2);
+				color: var(--muted);
+			}
+			.pill.ok {
+				border-color: rgba(74, 222, 128, 0.4);
+				color: var(--ok);
+				background: rgba(74, 222, 128, 0.1);
+			}
+			.pill.warn {
+				border-color: rgba(251, 191, 36, 0.4);
+				color: var(--warn);
+				background: rgba(251, 191, 36, 0.1);
+			}
+			.pill.bad {
+				border-color: rgba(248, 113, 113, 0.4);
+				color: var(--danger);
+				background: rgba(248, 113, 113, 0.1);
+			}
+
+			/* -------------------------------------------------------- toolbar */
+			.toolbar {
+				display: flex;
+				align-items: center;
+				gap: 12px;
+				flex-wrap: wrap;
+				margin-top: 24px;
+			}
+			.toolbar .spacer {
+				flex: 1;
+			}
+			.toolbar .meta {
+				color: var(--faint);
+				font-size: 0.84rem;
+			}
+			.switch {
+				display: inline-flex;
+				align-items: center;
+				gap: 8px;
+				color: var(--muted);
+				font-size: 0.85rem;
+				cursor: pointer;
+				user-select: none;
+			}
+			.switch input {
+				width: 16px;
+				height: 16px;
+				accent-color: #22d3ee;
+			}
+
+			/* -------------------------------------------------------- message */
+			.message {
+				margin-top: 18px;
+				border-radius: 13px;
+				padding: 12px 16px;
+				font-size: 0.9rem;
+				border: 1px solid var(--border);
+				background: var(--panel-2);
+				color: var(--muted);
+			}
+			.message.ok {
+				border-color: rgba(74, 222, 128, 0.4);
+				background: rgba(74, 222, 128, 0.08);
+				color: #bbf7d0;
+			}
+			.message.error {
+				border-color: rgba(248, 113, 113, 0.4);
+				background: rgba(248, 113, 113, 0.08);
+				color: #fecaca;
+			}
+			.message[hidden] {
+				display: none;
+			}
+
+			.settings-grid {
+				display: grid;
+				grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+				gap: 14px;
+			}
+			.setting {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 16px;
+				background: var(--panel-2);
+				border: 1px solid var(--border-soft);
+				border-radius: 13px;
+				padding: 14px 16px;
+			}
+			.setting p {
+				margin: 2px 0 0;
+				color: var(--faint);
+				font-size: 0.82rem;
+			}
+			.setting strong {
+				font-size: 0.94rem;
+			}
+
+			@media (max-width: 620px) {
+				.wrap {
+					padding: 22px 16px 64px;
+				}
+				.card {
+					padding: 20px;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<div class="wrap">
+			<header class="site-header">
+				<img src="/logo.svg" alt="" width="52" height="52" />
+				<div class="brand">
+					<h1>Relay administration</h1>
+					<p>cf-activity-relay · <span id="header-domain" class="mono">relay</span></p>
+				</div>
+				<div class="header-actions">
+					<a class="button" href="/">← Back to site</a>
+					<button class="button" id="sign-out" type="button" hidden>Sign out</button>
+				</div>
+			</header>
+
+			<!-- ------------------------------------------------------------ login -->
+			<section class="login-shell" id="login-view">
+				<form class="login" id="login-form" autocomplete="off">
+					<h2>Sign in</h2>
+					<p>Enter the relay admin token. It is kept in this browser tab only and sent as a bearer token to the relay API.</p>
+					<label for="token">Admin token</label>
+					<input id="token" name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" spellcheck="false" required />
+					<button class="button primary" type="submit" id="login-button">Unlock dashboard</button>
+					<p class="hint" id="login-hint">The token is the value of the <span class="mono">ADMIN_TOKEN</span> secret.</p>
+				</form>
+			</section>
+
+			<!-- -------------------------------------------------------- dashboard -->
+			<section id="dashboard-view" hidden>
+				<div class="toolbar">
+					<button class="button primary" id="refresh" type="button">Refresh</button>
+					<label class="switch"><input type="checkbox" id="auto-refresh" checked /> Auto-refresh every 30 s</label>
+					<span class="spacer"></span>
+					<span class="meta" id="last-updated">never</span>
+				</div>
+
+				<div class="message" id="message" role="status" aria-live="polite" hidden></div>
+
+				<dl class="stats" id="counts"></dl>
+
+				<article class="card">
+					<h2>Settings</h2>
+					<p class="card-sub">Runtime policy stored in the relay database. Environment variables only provide the initial value.</p>
+					<div class="settings-grid">
+						<div class="setting">
+							<div>
+								<strong>Manual approval</strong>
+								<p>New subscriptions wait in the pending queue until accepted.</p>
+							</div>
+							<label class="switch"><input type="checkbox" id="setting-manual" /> enabled</label>
+						</div>
+						<div class="setting">
+							<div>
+								<strong>Person-only publishing</strong>
+								<p>Only <span class="mono">Person</span> actors may publish through the relay.</p>
+							</div>
+							<label class="switch"><input type="checkbox" id="setting-person-only" /> enabled</label>
+						</div>
+					</div>
+				</article>
+
+				<article class="card">
+					<h2>Pending requests</h2>
+					<p class="card-sub">Subscriptions waiting for manual approval.</p>
+					<div id="pending-table"></div>
+				</article>
+
+				<article class="card">
+					<h2>Receivers</h2>
+					<p class="card-sub">Instances that receive relay traffic. Removing one is equivalent to an accepted <span class="mono">Undo&nbsp;Follow</span>.</p>
+					<div id="subscribers-table"></div>
+					<h2 style="margin-top: 22px">Follower-style receivers</h2>
+					<p class="card-sub">Server actors that follow the relay actor and receive the reciprocal follow.</p>
+					<div id="followers-table"></div>
+				</article>
+
+				<article class="card">
+					<h2>Add a receiver</h2>
+					<p class="card-sub">Resolves the actor's shared inbox and registers it as a traditional subscriber, without needing a relay UI on the remote server.</p>
+					<form class="field" id="subscribe-form">
+						<div class="grow">
+							<label for="subscribe-actor">Actor URL</label>
+							<input id="subscribe-actor" type="url" placeholder="https://instance.example/actor" spellcheck="false" required />
+						</div>
+						<button class="button primary" type="submit">Subscribe</button>
+					</form>
+					<p class="hint">Examples: <span class="mono">https://mastodon.example/actor</span>, <span class="mono">https://instance.example/users/guardian</span>.</p>
+				</article>
+
+				<article class="card">
+					<h2>Domain policy</h2>
+					<p class="card-sub">Blocked domains are rejected with <span class="mono">401</span>. Limited domains are silently skipped and never receive a reciprocal follow.</p>
+					<form class="field" id="domain-form">
+						<div class="grow">
+							<label for="domain-input">Domain</label>
+							<input id="domain-input" type="text" placeholder="spam.example" spellcheck="false" required />
+						</div>
+						<div>
+							<label for="domain-action">Action</label>
+							<select id="domain-action">
+								<option value="block">Block</option>
+								<option value="limit">Limit</option>
+							</select>
+						</div>
+						<button class="button primary" type="submit">Apply</button>
+					</form>
+					<h2 style="margin-top: 22px">Blocked</h2>
+					<div id="blocked-table"></div>
+					<h2 style="margin-top: 22px">Limited</h2>
+					<div id="limited-table"></div>
+				</article>
+
+				<article class="card">
+					<h2>Maintenance</h2>
+					<p class="card-sub">Send an <span class="mono">Update</span> containing the relay actor document to every receiver.</p>
+					<button class="button" id="send-update" type="button">Broadcast actor Update</button>
+				</article>
+
+				<article class="card">
+					<h2>Publishers</h2>
+					<p class="card-sub">Domains observed sending verified public activities.</p>
+					<div id="publishers-table"></div>
+				</article>
+
+				<article class="card">
+					<h2>Inbound audit trail</h2>
+					<p class="card-sub">Every request to <span class="mono">/inbox</span>, with its rejection reason. Retained for seven days.</p>
+					<div class="field" style="margin-bottom: 14px">
+						<div>
+							<label for="log-limit">Rows</label>
+							<select id="log-limit">
+								<option value="25">25</option>
+								<option value="50" selected>50</option>
+								<option value="100">100</option>
+								<option value="200">200</option>
+							</select>
+						</div>
+					</div>
+					<div id="log-table"></div>
+				</article>
+			</section>
+		</div>
+
+		<script>
+			'use strict';
+			const TOKEN_KEY = 'cf-activity-relay:admin-token';
+			const REFRESH_MS = 30000;
+
+			let token = '';
+			let refreshTimer = null;
+			let busy = false;
+
+			const $ = (id) => document.getElementById(id);
+			const loginView = $('login-view');
+			const dashboardView = $('dashboard-view');
+			const messageBar = $('message');
+
+			// ------------------------------------------------------------- helpers
+			function el(tag, props, children) {
+				const node = document.createElement(tag);
+				for (const [key, value] of Object.entries(props || {})) {
+					if (value === undefined || value === null) continue;
+					if (key === 'text') node.textContent = value;
+					else if (key === 'class') node.className = value;
+					else if (key === 'href') node.href = value;
+					else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+					else node.setAttribute(key, value);
+				}
+				for (const child of [].concat(children || [])) {
+					if (child === undefined || child === null) continue;
+					node.append(child);
+				}
+				return node;
+			}
+
+			function mono(value) {
+				return el('span', { class: 'mono', text: value });
+			}
+
+			function pill(text, kind) {
+				return el('span', { class: 'pill' + (kind ? ' ' + kind : ''), text });
+			}
+
+			function empty(text) {
+				return el('p', { class: 'empty', text });
+			}
+
+			function table(headers, rows, emptyText) {
+				if (!rows.length) return empty(emptyText || 'Nothing to show.');
+				const head = el(
+					'tr',
+					{},
+					headers.map((header) => el('th', { text: header, class: header === 'Domain' || header === 'Actor' ? 'mono' : undefined })),
+				);
+				const body = el('tbody', {}, rows);
+				return el('div', { class: 'table-scroll' }, el('table', {}, [el('thead', {}, head), body]));
+			}
+
+			function when(value) {
+				if (!value) return '—';
+				const date = new Date(value);
+				if (Number.isNaN(date.getTime())) return value;
+				return date.toLocaleString();
+			}
+
+			function notify(text, kind) {
+				messageBar.textContent = text;
+				messageBar.className = 'message' + (kind ? ' ' + kind : '');
+				messageBar.hidden = false;
+				if (kind === 'ok') setTimeout(() => { messageBar.hidden = true; }, 4000);
+			}
+
+			// ----------------------------------------------------------------- api
+			async function api(path, options) {
+				const opts = options || {};
+				const headers = Object.assign({ Accept: 'application/json' }, opts.headers || {});
+				if (token) headers.Authorization = 'Bearer ' + token;
+				let body;
+				if (opts.body !== undefined) {
+					headers['Content-Type'] = 'application/json';
+					body = JSON.stringify(opts.body);
+				}
+				const response = await fetch(path, { method: opts.method || 'GET', headers, body });
+				let data = null;
+				try { data = await response.json(); } catch { data = null; }
+				if (response.status === 401) {
+					signOut('The token was rejected. Sign in again.');
+					throw new Error('unauthorized');
+				}
+				if (response.status === 404) {
+					signOut('The admin API is disabled. Set the ADMIN_TOKEN secret and redeploy the Worker.');
+					throw new Error('disabled');
+				}
+				if (!response.ok) {
+					const detail = data && (data.error || data.message || data.status);
+					throw new Error(detail ? String(detail) : 'Request failed (' + response.status + ')');
+				}
+				return data;
+			}
+
+			// -------------------------------------------------------------- views
+			function showLogin() {
+				loginView.hidden = false;
+				dashboardView.hidden = true;
+				$('sign-out').hidden = true;
+				$('token').focus();
+			}
+
+			function showDashboard() {
+				loginView.hidden = true;
+				dashboardView.hidden = false;
+				$('sign-out').hidden = false;
+			}
+
+			function signOut(reason) {
+				token = '';
+				try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+				stopAutoRefresh();
+				showLogin();
+				if (reason) notify(reason, 'error');
+			}
+
+			function startAutoRefresh() {
+				stopAutoRefresh();
+				if (!$('auto-refresh').checked) return;
+				refreshTimer = setInterval(() => {
+					if (!document.hidden && !busy && token) load();
+				}, REFRESH_MS);
+			}
+
+			function stopAutoRefresh() {
+				if (refreshTimer) clearInterval(refreshTimer);
+				refreshTimer = null;
+			}
+
+			// ------------------------------------------------------------- render
+			function renderCounts(counts) {
+				const items = [
+					['Subscribers', counts.subscribers],
+					['Followers', counts.followers],
+					['Pending', counts.pending],
+					['Publishers', counts.publishers],
+					['Blocked', counts.blocked],
+					['Limited', counts.limited],
+				];
+				$('counts').replaceChildren(
+					...items.map(([label, value]) => el('div', { class: 'stat' }, [el('dt', { text: label }), el('dd', { text: String(value) })]))
+				);
+			}
+
+			function renderSettings(settings) {
+				$('setting-manual').checked = Boolean(settings.manuallyAccept);
+				$('setting-person-only').checked = Boolean(settings.personOnly);
+			}
+
+			function actionButton(label, handler, kind) {
+				return el('button', { class: 'button small' + (kind ? ' ' + kind : ''), type: 'button', text: label, onClick: handler });
+			}
+
+			function renderPending(pending) {
+				$('pending-table').replaceChildren(
+					table(
+						['Domain', 'Actor', 'Requested', ''],
+						pending.map((entry) =>
+							el('tr', {}, [
+								el('td', { class: 'mono', text: entry.domain }),
+								el('td', { class: 'mono', text: entry.actor }),
+								el('td', { text: when(entry.createdAt) }),
+								el('td', { class: 'actions' }, [
+									actionButton('Accept', () => act('pending/' + encodeURIComponent(entry.domain) + '/accept', 'Accepted ' + entry.domain), 'primary'),
+									actionButton('Reject', () => act('pending/' + encodeURIComponent(entry.domain) + '/reject', 'Rejected ' + entry.domain), 'danger'),
+								]),
+							])
+						),
+						'No pending requests.'
+					)
+				);
+			}
+
+			function renderReceivers(state) {
+				const receiverRows = (list, showMutual) =>
+					list.map((receiver) =>
+						el('tr', {}, [
+							el('td', { class: 'mono', text: receiver.domain }),
+							el('td', { class: 'mono', text: receiver.actorId }),
+							el('td', { class: 'mono', text: receiver.inboxUrl }),
+							showMutual ? el('td', {}, [receiver.mutuallyFollow ? pill('mutual', 'ok') : pill('pending', 'warn')]) : el('td', {}, [pill(receiver.kind, 'ok')]),
+							el('td', { class: 'actions' }, [
+								actionButton('Remove', () => act('unsubscribe', 'Removed ' + receiver.domain, { domain: receiver.domain }), 'danger'),
+							]),
+						])
+					);
+
+				$('subscribers-table').replaceChildren(
+					table(
+						['Domain', 'Actor', 'Inbox', 'Kind', ''],
+						receiverRows(state.subscribers, false),
+						'No subscribers.'
+					)
+				);
+				$('followers-table').replaceChildren(
+					table(
+						['Domain', 'Actor', 'Inbox', 'Follow', ''],
+						receiverRows(state.followers, true),
+						'No follower-style receivers.'
+					)
+				);
+			}
+
+			function renderDomains(blocked, limited) {
+				const rows = (list, action, label) =>
+					list.map((domain) =>
+						el('tr', {}, [
+							el('td', { class: 'mono', text: domain }),
+							el('td', { class: 'actions' }, [actionButton(label, () => act('domains/' + encodeURIComponent(domain) + '/' + action, label + ' ' + domain), 'danger')]),
+						])
+					);
+				$('blocked-table').replaceChildren(table(['Domain', ''], rows(blocked, 'unblock', 'Unblock'), 'No blocked domains.'));
+				$('limited-table').replaceChildren(table(['Domain', ''], rows(limited, 'unlimit', 'Unlimit'), 'No limited domains.'));
+			}
+
+			function renderPublishers(publishers) {
+				$('publishers-table').replaceChildren(
+					table(
+						['Domain', 'Actor', 'Last activity', 'Last seen', 'Count', ''],
+						publishers.map((publisher) =>
+							el('tr', {}, [
+								el('td', { class: 'mono', text: publisher.domain }),
+								el('td', { class: 'mono', text: publisher.actorId }),
+								el('td', { text: publisher.lastActivityType || '—' }),
+								el('td', { text: when(publisher.lastSeen) }),
+								el('td', { text: String(publisher.activityCount) }),
+								el('td', { class: 'actions' }, [actionButton('Block', () => act('domains/' + encodeURIComponent(publisher.domain) + '/block', 'Blocked ' + publisher.domain), 'danger')]),
+							])
+						),
+						'No publishers observed yet.'
+					)
+				);
+			}
+
+			function renderLog(entries) {
+				$('log-table').replaceChildren(
+					table(
+						['Time', 'Type', 'Actor', 'Activity', 'Status', 'Reason'],
+						entries.map((entry) =>
+							el('tr', {}, [
+								el('td', { text: when(entry.at) }),
+								el('td', { text: entry.type }),
+								el('td', { class: 'mono', text: entry.actor || '—' }),
+								el('td', { class: 'mono', text: entry.activity_id || '—' }),
+								el('td', {}, [pill(String(entry.status), entry.status < 300 ? 'ok' : entry.status < 500 ? 'warn' : 'bad')]),
+								el('td', { text: entry.reason || '—' }),
+							])
+						),
+						'No inbound activity recorded yet.'
+					)
+				);
+			}
+
+			// -------------------------------------------------------------- load
+			async function load() {
+				if (busy || !token) return;
+				busy = true;
+				$('refresh').disabled = true;
+				try {
+					const limit = $('log-limit').value || '50';
+					const [state, log] = await Promise.all([api('/admin/state'), api('/admin/log?limit=' + encodeURIComponent(limit))]);
+					$('header-domain').textContent = state.domain || '';
+					renderCounts(state.counts);
+					renderSettings(state.settings || {});
+					renderPending(state.pending || []);
+					renderReceivers(state);
+					renderDomains(state.blocked || [], state.limited || []);
+					renderPublishers(state.publishers || []);
+					renderLog((log && log.entries) || []);
+					$('last-updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+				} catch (error) {
+					if (error && error.message !== 'unauthorized' && error.message !== 'disabled') {
+						notify(error.message || 'Unable to load the relay state.', 'error');
+					}
+				} finally {
+					busy = false;
+					$('refresh').disabled = false;
+				}
+			}
+
+			// ------------------------------------------------------------ actions
+			async function act(path, successMessage, body) {
+				try {
+					const result = await api('/admin/' + path, { method: 'POST', body });
+					const queued = result && typeof result.queued === 'number' ? ' (' + result.queued + ' queued)' : '';
+					notify(successMessage + queued, 'ok');
+					await load();
+				} catch (error) {
+					if (error && error.message !== 'unauthorized' && error.message !== 'disabled') {
+						notify(error.message || 'The action failed.', 'error');
+					}
+				}
+			}
+
+			// --------------------------------------------------------------- wire
+			$('login-form').addEventListener('submit', async (event) => {
+				event.preventDefault();
+				const candidate = $('token').value.trim();
+				if (!candidate) return;
+				token = candidate;
+				$('login-button').disabled = true;
+				try {
+					await api('/admin/state');
+					try { sessionStorage.setItem(TOKEN_KEY, token); } catch {}
+					showDashboard();
+					notify('Signed in.', 'ok');
+					startAutoRefresh();
+					await load();
+				} catch (error) {
+					if (error && error.message === 'unauthorized') return;
+					if (error && error.message === 'disabled') return;
+					notify(error.message || 'Unable to sign in.', 'error');
+				} finally {
+					$('login-button').disabled = false;
+				}
+			});
+
+			$('sign-out').addEventListener('click', () => signOut('Signed out.'));
+			$('refresh').addEventListener('click', () => load());
+			$('auto-refresh').addEventListener('change', () => {
+				if ($('auto-refresh').checked) startAutoRefresh();
+				else stopAutoRefresh();
+			});
+			$('log-limit').addEventListener('change', () => load());
+
+			$('subscribe-form').addEventListener('submit', async (event) => {
+				event.preventDefault();
+				const actor = $('subscribe-actor').value.trim();
+				if (!actor) return;
+				await act('subscribe', 'Subscribed ' + actor, { actor });
+				$('subscribe-actor').value = '';
+			});
+
+			$('domain-form').addEventListener('submit', async (event) => {
+				event.preventDefault();
+				const domain = $('domain-input').value.trim().toLowerCase();
+				const action = $('domain-action').value;
+				if (!domain) return;
+				await act('domains/' + encodeURIComponent(domain) + '/' + action, action === 'block' ? 'Blocked ' : 'Limited ' + domain);
+				$('domain-input').value = '';
+			});
+
+			$('setting-manual').addEventListener('change', (event) => act('settings', 'Manual approval updated', { manuallyAccept: event.target.checked }));
+			$('setting-person-only').addEventListener('change', (event) => act('settings', 'Person-only policy updated', { personOnly: event.target.checked }));
+			$('send-update').addEventListener('click', () => act('update', 'Actor Update queued'));
+
+			document.addEventListener('visibilitychange', () => {
+				if (!document.hidden && token && $('auto-refresh').checked) load();
+			});
+
+			// --------------------------------------------------------------- boot
+			(async () => {
+				try {
+					const stored = sessionStorage.getItem(TOKEN_KEY);
+					if (stored) {
+						token = stored;
+						await api('/admin/state');
+						showDashboard();
+						startAutoRefresh();
+						await load();
+						return;
+					}
+				} catch (error) {
+					// fall through to the login form
+				}
+				token = '';
+				showLogin();
+			})();
+		</script>
+	</body>
+</html>

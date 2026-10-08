@@ -14,263 +14,439 @@
 				--bg: #0b0a1c;
 				--panel: #15142c;
 				--panel-2: #1c1b38;
-				--border: #2c2a52;
+				--border: #2e2c56;
+				--border-soft: #262449;
 				--text: #eef2ff;
-				--muted: #a5a8c7;
+				--muted: #b6bbd6;
+				--faint: #8b90b4;
 				--accent: #67e8f9;
 				--accent-2: #a5b4fc;
 				--ok: #4ade80;
+				--radius: 18px;
+				--shadow: 0 18px 50px rgba(4, 3, 18, 0.55);
 			}
 			* {
 				box-sizing: border-box;
 			}
+			html {
+				-webkit-text-size-adjust: 100%;
+			}
 			body {
 				margin: 0;
+				min-height: 100vh;
 				background:
-					radial-gradient(1100px 500px at 15% -10%, rgba(67, 56, 202, 0.45), transparent 60%),
-					radial-gradient(900px 500px at 90% 0%, rgba(8, 145, 178, 0.35), transparent 55%), var(--bg);
+					radial-gradient(1100px 520px at 12% -12%, rgba(67, 56, 202, 0.42), transparent 62%),
+					radial-gradient(900px 480px at 92% -6%, rgba(8, 145, 178, 0.32), transparent 58%), var(--bg);
 				color: var(--text);
 				font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-				line-height: 1.6;
-				min-height: 100vh;
+				font-size: 17px;
+				line-height: 1.7;
+				text-rendering: optimizeLegibility;
+			}
+			a {
+				color: var(--accent);
+				text-decoration-color: rgba(103, 232, 249, 0.4);
+				text-underline-offset: 3px;
+			}
+			a:hover {
+				text-decoration-color: var(--accent);
+			}
+			:focus-visible {
+				outline: 2px solid var(--accent);
+				outline-offset: 2px;
+				border-radius: 6px;
 			}
 			.wrap {
-				max-width: 980px;
+				width: 100%;
+				max-width: 1080px;
 				margin: 0 auto;
-				padding: 40px 24px 72px;
+				padding: 34px 24px 72px;
 			}
-			header {
+
+			/* ---------------------------------------------------------- header */
+			.site-header {
 				display: flex;
 				align-items: center;
 				gap: 18px;
 				flex-wrap: wrap;
+				padding-bottom: 26px;
+				border-bottom: 1px solid var(--border-soft);
 			}
-			header img {
-				width: 64px;
-				height: 64px;
-				border-radius: 16px;
-				box-shadow: 0 12px 40px rgba(34, 211, 238, 0.25);
+			.site-header img {
+				width: 56px;
+				height: 56px;
+				border-radius: 15px;
+				box-shadow: 0 12px 34px rgba(34, 211, 238, 0.22);
+				flex: none;
 			}
-			header h1 {
+			.brand {
+				min-width: 0;
+			}
+			.brand h1 {
 				margin: 0;
-				font-size: clamp(1.5rem, 4vw, 2.1rem);
+				font-size: clamp(1.35rem, 3vw, 1.7rem);
 				letter-spacing: -0.02em;
+				line-height: 1.25;
 			}
-			header p {
+			.brand p {
 				margin: 2px 0 0;
 				color: var(--muted);
+				font-size: 0.92rem;
+			}
+			.header-actions {
+				margin-left: auto;
+				display: flex;
+				align-items: center;
+				gap: 12px;
+				flex-wrap: wrap;
 			}
 			.badge {
 				display: inline-flex;
 				align-items: center;
 				gap: 8px;
 				background: rgba(74, 222, 128, 0.12);
-				border: 1px solid rgba(74, 222, 128, 0.35);
+				border: 1px solid rgba(74, 222, 128, 0.32);
 				color: var(--ok);
 				border-radius: 999px;
 				padding: 6px 14px;
-				font-size: 0.85rem;
+				font-size: 0.82rem;
 				font-weight: 600;
-				margin-left: auto;
+				letter-spacing: 0.01em;
+				white-space: nowrap;
+			}
+			.badge.is-down {
+				background: rgba(248, 113, 113, 0.12);
+				border-color: rgba(248, 113, 113, 0.32);
+				color: #fca5a5;
 			}
 			.dot {
 				width: 8px;
 				height: 8px;
 				border-radius: 50%;
 				background: currentColor;
+				flex: none;
 			}
-			.hero {
-				margin-top: 42px;
-				background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+			.button {
+				display: inline-flex;
+				align-items: center;
+				gap: 8px;
+				border-radius: 999px;
+				padding: 9px 18px;
+				font-size: 0.9rem;
+				font-weight: 600;
+				text-decoration: none;
 				border: 1px solid var(--border);
-				border-radius: 24px;
-				padding: 32px;
+				background: rgba(255, 255, 255, 0.04);
+				color: var(--text);
+				transition: border-color 0.15s ease, background 0.15s ease;
+			}
+			.button:hover {
+				border-color: var(--accent-2);
+				background: rgba(165, 180, 252, 0.1);
+			}
+
+			/* ------------------------------------------------------------ hero */
+			.hero {
+				padding: 44px 0 8px;
 			}
 			.hero h2 {
-				margin: 0 0 8px;
-				font-size: clamp(1.6rem, 5vw, 2.4rem);
+				margin: 0 0 14px;
+				font-size: clamp(1.9rem, 5vw, 2.7rem);
+				line-height: 1.15;
 				letter-spacing: -0.03em;
+				max-width: 24ch;
 			}
-			.hero p {
+			.lede {
 				margin: 0;
-				color: var(--muted);
 				max-width: 62ch;
+				color: var(--muted);
+				font-size: 1.05rem;
 			}
+			.lede code {
+				white-space: nowrap;
+			}
+
+			/* ----------------------------------------------------------- stats */
 			.stats {
 				display: grid;
-				grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+				grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 				gap: 16px;
-				margin-top: 26px;
+				margin-top: 34px;
 			}
 			.stat {
-				background: var(--panel);
+				background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0)) , var(--panel);
 				border: 1px solid var(--border);
-				border-radius: 18px;
-				padding: 18px 20px;
+				border-radius: var(--radius);
+				padding: 20px 22px;
+				box-shadow: var(--shadow);
 			}
-			.stat span {
-				display: block;
-				color: var(--muted);
-				font-size: 0.82rem;
+			.stat dt {
+				margin: 0;
+				color: var(--faint);
+				font-size: 0.76rem;
+				font-weight: 700;
 				text-transform: uppercase;
-				letter-spacing: 0.08em;
+				letter-spacing: 0.09em;
 			}
-			.stat strong {
-				display: block;
-				font-size: 1.9rem;
+			.stat dd {
+				margin: 6px 0 0;
+				font-size: 2rem;
+				font-weight: 700;
 				letter-spacing: -0.02em;
-				margin-top: 4px;
+				line-height: 1.1;
 			}
 			.stat small {
-				color: var(--accent-2);
+				display: block;
+				margin-top: 4px;
+				color: var(--muted);
+				font-size: 0.85rem;
 			}
+
+			/* ----------------------------------------------------------- cards */
 			.grid {
 				display: grid;
-				grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+				grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
 				gap: 20px;
-				margin-top: 24px;
+				margin-top: 30px;
 			}
 			.card {
 				background: var(--panel);
 				border: 1px solid var(--border);
-				border-radius: 20px;
-				padding: 26px;
+				border-radius: var(--radius);
+				padding: 28px;
+				box-shadow: var(--shadow);
 			}
 			.card h3 {
-				margin: 0 0 12px;
-				font-size: 1.05rem;
+				margin: 0 0 16px;
+				font-size: 1.08rem;
+				letter-spacing: -0.01em;
 			}
-			.card p,
-			.card li {
+			.card p {
+				margin: 0 0 14px;
 				color: var(--muted);
-				font-size: 0.95rem;
+				max-width: 68ch;
 			}
-			.card ul {
+			.card p:last-child {
+				margin-bottom: 0;
+			}
+			.card-note {
+				margin-top: 20px;
+				border-color: rgba(165, 180, 252, 0.32);
+				background: linear-gradient(180deg, rgba(165, 180, 252, 0.08), rgba(165, 180, 252, 0.02)), var(--panel);
+			}
+
+			/* ------------------------------------------------------- endpoints */
+			.endpoints {
 				margin: 0;
-				padding-left: 18px;
+				display: grid;
+				gap: 10px;
 			}
+			.endpoint {
+				display: grid;
+				grid-template-columns: minmax(120px, auto) 1fr;
+				gap: 6px 16px;
+				align-items: baseline;
+				background: var(--panel-2);
+				border: 1px solid var(--border-soft);
+				border-radius: 12px;
+				padding: 12px 16px;
+			}
+			.endpoint dt {
+				color: var(--faint);
+				font-size: 0.82rem;
+				font-weight: 600;
+				text-transform: uppercase;
+				letter-spacing: 0.06em;
+				margin: 0;
+			}
+			.endpoint dd {
+				margin: 0;
+				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+				font-size: 0.86rem;
+				color: var(--accent);
+				overflow-wrap: anywhere;
+			}
+			.endpoint dd a {
+				text-decoration: none;
+			}
+
+			/* ---------------------------------------------------------- steps */
+			.steps {
+				margin: 0;
+				padding: 0;
+				list-style: none;
+				display: grid;
+				gap: 16px;
+				counter-reset: step;
+			}
+			.steps li {
+				position: relative;
+				padding-left: 42px;
+				color: var(--muted);
+			}
+			.steps li strong {
+				color: var(--text);
+			}
+			.steps li::before {
+				counter-increment: step;
+				content: counter(step);
+				position: absolute;
+				left: 0;
+				top: 1px;
+				width: 26px;
+				height: 26px;
+				border-radius: 50%;
+				display: grid;
+				place-items: center;
+				background: rgba(103, 232, 249, 0.12);
+				border: 1px solid rgba(103, 232, 249, 0.3);
+				color: var(--accent);
+				font-size: 0.8rem;
+				font-weight: 700;
+			}
+
 			code,
 			.mono {
 				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-				font-size: 0.88em;
+				font-size: 0.87em;
 				background: var(--panel-2);
-				border: 1px solid var(--border);
-				border-radius: 8px;
+				border: 1px solid var(--border-soft);
+				border-radius: 7px;
 				padding: 2px 7px;
 				color: var(--accent);
-				word-break: break-all;
+				overflow-wrap: anywhere;
 			}
-			a {
-				color: var(--accent);
-			}
-			.endpoints {
-				display: grid;
-				gap: 10px;
-				margin-top: 6px;
-			}
-			.endpoint {
-				display: flex;
-				justify-content: space-between;
-				gap: 12px;
-				align-items: center;
-				background: var(--panel-2);
-				border: 1px solid var(--border);
-				border-radius: 12px;
-				padding: 10px 14px;
-				font-size: 0.9rem;
-			}
-			.endpoint span {
-				color: var(--muted);
-				white-space: nowrap;
-			}
+
 			footer {
-				margin-top: 40px;
-				padding-top: 24px;
-				border-top: 1px solid var(--border);
-				color: var(--muted);
+				margin-top: 44px;
+				padding-top: 22px;
+				border-top: 1px solid var(--border-soft);
+				color: var(--faint);
 				font-size: 0.88rem;
 				display: flex;
 				justify-content: space-between;
-				gap: 16px;
+				gap: 14px 24px;
 				flex-wrap: wrap;
+			}
+
+			@media (max-width: 560px) {
+				body {
+					font-size: 16px;
+				}
+				.wrap {
+					padding: 24px 18px 56px;
+				}
+				.card {
+					padding: 22px;
+				}
+				.endpoint {
+					grid-template-columns: 1fr;
+				}
 			}
 		</style>
 	</head>
 	<body>
 		<div class="wrap">
-			<header>
-				<img src="/logo.svg" alt="cf-activity-relay logo" width="64" height="64" />
-				<div>
+			<header class="site-header">
+				<img src="/logo.svg" alt="" width="56" height="56" />
+				<div class="brand">
 					<h1>cf-activity-relay</h1>
-					<p>ActivityPub relay · <span class="mono" id="domain">relay.manalejandro.com</span></p>
+					<p>ActivityPub relay · <span class="mono" id="domain">relay.example.org</span></p>
 				</div>
-				<span class="badge"><span class="dot"></span><span id="status-label">checking status…</span></span>
+				<div class="header-actions">
+					<span class="badge" id="status-badge"><span class="dot"></span><span id="status-label">checking…</span></span>
+					<a class="button" href="/admin/">Manage relay</a>
+				</div>
 			</header>
 
-			<section class="hero">
-				<h2>One inbox for the fediverse</h2>
-				<p>
-					This server relays public ActivityPub traffic between subscribed instances. Traditional relays register through
-					<code>/inbox</code>; server actors that prefer following can follow the relay actor at <code>/actor</code>. Every delivery is signed
-					with the relay key using legacy Fediverse HTTP signatures or RFC 9421.
-				</p>
-				<div class="stats">
-					<div class="stat">
-						<span>Connected instances</span>
-						<strong id="connected">–</strong>
-						<small>receiving or publishing</small>
-					</div>
-					<div class="stat">
-						<span>Receiving instances</span>
-						<strong id="receiving">–</strong>
-						<small>subscribers and followers</small>
-					</div>
-					<div class="stat">
-						<span>Publishers</span>
-						<strong id="publishers">–</strong>
-						<small>observed senders</small>
-					</div>
-					<div class="stat">
-						<span>Registration</span>
-						<strong id="registration">–</strong>
-						<small id="policy">public posts only</small>
-					</div>
-				</div>
-			</section>
+			<main>
+				<section class="hero">
+					<h2>One inbox for the fediverse</h2>
+					<p class="lede">
+						This server relays public ActivityPub traffic between subscribed instances. Traditional relays register through <code>/inbox</code>; server
+						actors can instead follow the relay actor at <code>/actor</code>. Every delivery is signed with the relay key using legacy Fediverse HTTP
+						signatures or RFC 9421.
+					</p>
+					<dl class="stats">
+						<div class="stat">
+							<dt>Connected instances</dt>
+							<dd id="connected">–</dd>
+							<small>receiving or publishing</small>
+						</div>
+						<div class="stat">
+							<dt>Receiving instances</dt>
+							<dd id="receiving">–</dd>
+							<small>subscribers and followers</small>
+						</div>
+						<div class="stat">
+							<dt>Publishers</dt>
+							<dd id="publishers">–</dd>
+							<small>observed senders</small>
+						</div>
+						<div class="stat">
+							<dt>Registration</dt>
+							<dd id="registration">–</dd>
+							<small id="policy">public posts only</small>
+						</div>
+					</dl>
+				</section>
 
-			<div class="grid">
-				<div class="card">
-					<h3>Endpoints</h3>
-					<div class="endpoints">
-						<div class="endpoint"><span>Actor</span><a class="mono" id="ep-actor" href="/actor">/actor</a></div>
-						<div class="endpoint"><span>Shared inbox</span><span class="mono">/inbox</span></div>
-						<div class="endpoint"><span>WebFinger</span><span class="mono">acct:relay@<span id="ep-domain">relay.manalejandro.com</span></span></div>
-						<div class="endpoint"><span>Status</span><a class="mono" href="/status.json">/status.json</a></div>
-						<div class="endpoint"><span>NodeInfo</span><a class="mono" href="/nodeinfo/2.1">/nodeinfo/2.1</a></div>
-					</div>
+				<div class="grid">
+					<article class="card">
+						<h3>Endpoints</h3>
+						<dl class="endpoints">
+							<div class="endpoint">
+								<dt>Actor</dt>
+								<dd><a id="ep-actor" href="/actor">/actor</a></dd>
+							</div>
+							<div class="endpoint">
+								<dt>Shared inbox</dt>
+								<dd>/inbox</dd>
+							</div>
+							<div class="endpoint">
+								<dt>WebFinger</dt>
+								<dd>acct:relay@<span class="ep-domain">relay.example.org</span></dd>
+							</div>
+							<div class="endpoint">
+								<dt>Status</dt>
+								<dd><a href="/status.json">/status.json</a></dd>
+							</div>
+							<div class="endpoint">
+								<dt>NodeInfo</dt>
+								<dd><a href="/nodeinfo/2.1">/nodeinfo/2.1</a></dd>
+							</div>
+						</dl>
+					</article>
+
+					<article class="card">
+						<h3>How to subscribe</h3>
+						<ol class="steps">
+							<li><strong>Mastodon / Misskey:</strong> add <span class="mono">https://<span class="ep-domain">relay.example.org</span>/inbox</span> as a relay in your instance administration.</li>
+							<li><strong>Pleroma / Akkoma / Friendica:</strong> follow <span class="mono">@relay@<span class="ep-domain">relay.example.org</span></span> from your server actor.</li>
+							<li><strong>Unsubscribe:</strong> remove the relay or send <span class="mono">Undo&nbsp;Follow</span>.</li>
+						</ol>
+					</article>
 				</div>
-				<div class="card">
-					<h3>How to subscribe</h3>
-					<ul>
-						<li><strong>Mastodon / Misskey:</strong> add <span class="mono">https://<span class="ep-domain">relay.manalejandro.com</span>/inbox</span> as a relay in your instance administration.</li>
-						<li><strong>Pleroma / Akkoma / Friendica:</strong> follow <span class="mono">@relay@<span class="ep-domain">relay.manalejandro.com</span></span> from your server actor.</li>
-						<li><strong>Unsubscribe:</strong> remove the relay or send <span class="mono">Undo&nbsp;Follow</span>.</li>
-					</ul>
-					<p style="margin-top: 14px">
-						Relays connect <em>instances</em>, not personal accounts: a follow from a regular account is rejected by design, because the relay would otherwise send every
-						public activity to one person's home timeline.
+
+				<article class="card card-note">
+					<h3>About personal accounts</h3>
+					<p>
+						A relay connects <em>instances</em>, never personal accounts. Following the relay actor from a regular account is rejected on purpose, because the
+						relay would otherwise send every public activity to one person's home timeline.
 					</p>
-					<p style="margin-top: 14px">
-						Only public activities are distributed. The relay never exposes subscriber identities, inbox URLs or relayed activity history.
+					<p>
+						Only public activities are distributed, and the relay never exposes subscriber identities, inbox URLs or relayed activity history. Account
+						deletion notices are acknowledged without being relayed.
 					</p>
-				</div>
-			</div>
+				</article>
+			</main>
 
 			<footer>
 				<span>Built with Cloudflare Workers, D1, KV and Queues.</span>
 				<span><a href="https://github.com/manalejandro/cf-activity-relay" rel="noopener">Source</a> · MIT licensed · <span id="software">cf-activity-relay</span></span>
 			</footer>
 		</div>
+
 		<script>
 			(async () => {
 				const set = (id, value) => {
@@ -288,12 +464,16 @@
 					set('registration', status.manual_approval ? 'manual' : 'open');
 					set('policy', status.public_address_distribution_label || status.public_address_distribution_policy);
 					set('domain', status.domain);
-					document.querySelectorAll('.ep-domain').forEach((node) => (node.textContent = status.domain));
+					document.querySelectorAll('.ep-domain').forEach((node) => {
+						node.textContent = status.domain;
+					});
 					const actor = document.getElementById('ep-actor');
 					if (actor) actor.href = status.endpoints.actor;
 					set('software', status.software.name + ' ' + status.software.version);
 					document.title = status.name + ' — ActivityPub relay';
 				} catch (error) {
+					const badge = document.getElementById('status-badge');
+					if (badge) badge.classList.add('is-down');
 					set('status-label', 'status unavailable');
 				}
 			})();

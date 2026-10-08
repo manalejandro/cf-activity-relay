@@ -176,7 +176,9 @@ curl -s "https://relay.example.org/.well-known/webfinger?resource=acct:relay@rel
 
 ## Admin API
 
-Enabled only when `ADMIN_TOKEN` is set. Every request needs `Authorization: Bearer <ADMIN_TOKEN>`.
+The relay ships a small dashboard at **`/admin/`** that asks for the admin token, keeps it in the browser tab (`sessionStorage`) and drives every endpoint below. It shows live counts, settings, pending requests, receivers, publishers, the inbound audit trail and the domain policy, and it can accept/reject requests, add or remove receivers, block or limit domains, broadcast an actor `Update` and switch the runtime policies.
+
+The API is enabled only when `ADMIN_TOKEN` is set. Every request needs `Authorization: Bearer <ADMIN_TOKEN>`.
 
 | Request | Description |
 | --- | --- |

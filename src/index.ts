@@ -40,7 +40,17 @@ async function route(request: Request, env: Env, config: RelayConfig, url: URL):
 		default:
 			break;
 	}
-	if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+	if (url.pathname === '/admin') {
+		// The dashboard lives at /admin/ (a static asset); the API uses /admin/<section>.
+		return Response.redirect(new URL('/admin/', url).toString(), 308);
+	}
+	if (url.pathname.startsWith('/admin/')) {
+		// Serve the dashboard through the assets binding when the Worker handles
+		// the request directly (the asset server normally answers it first).
+		if (request.method === 'GET' || request.method === 'HEAD') {
+			const asset = await env.ASSETS.fetch(request);
+			if (asset.status !== 404) return asset;
+		}
 		return handleAdmin(env, config, request, url);
 	}
 	if (request.method === 'GET' || request.method === 'HEAD') {
