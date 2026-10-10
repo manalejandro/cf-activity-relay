@@ -3,8 +3,12 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { generateRsaKeyPair } from '../src/crypto/keys';
 import { signLegacyRequest } from '../src/crypto/legacy';
 import { signRfc9421Request } from '../src/crypto/rfc9421';
+import { loadConfig } from '../src/config';
 
-const RELAY = 'https://relay.manalejandro.com';
+// Derive the relay identity from the configured environment so the suite
+// follows whatever RELAY_DOMAIN the deployment uses.
+const CONFIG = loadConfig(env as unknown as Parameters<typeof loadConfig>[0]);
+const RELAY = CONFIG.baseUrl;
 const REMOTE_ACTOR = 'https://remote.example/actor';
 const REMOTE_KEY = `${REMOTE_ACTOR}#main-key`;
 const REMOTE_INBOX = 'https://remote.example/inbox';
@@ -100,7 +104,7 @@ describe('inbound inbox processing', () => {
 		stubFederation();
 		const body = followActivity('https://remote.example/activities/tampered');
 		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
-		const tampered = JSON.stringify({ ...JSON.parse(body), object: 'https://relay.manalejandro.com/actor' });
+		const tampered = JSON.stringify({ ...JSON.parse(body), object: CONFIG.actorId });
 		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body: tampered });
 		expect(response.status).toBe(400);
 	});
@@ -142,7 +146,7 @@ describe('inbound inbox processing', () => {
 		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem: identity.privateKeyPem, keyId: identity.keyId });
 		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
 		expect(response.status).toBe(202);
-		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('relay.manalejandro.com').first()).toBeFalsy();
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind(CONFIG.domain).first()).toBeFalsy();
 	});
 
 	it('records inbound events in the audit trail', async () => {
@@ -288,6 +292,53 @@ describe('inbound inbox processing', () => {
 
 		const publisher = await env.DB.prepare('SELECT last_activity_type FROM publishers WHERE domain = ?').bind('remote.example').first<{ last_activity_type: string }>();
 		expect(publisher?.last_activity_type).toBe('Delete');
+	});
+
+	it('unsubscribes on Undo{Follow} addressed publicly', async () => {
+		// cf-activitypub-next adds `to: [Public]` to the Undo while the original
+		// Follow has no audience. The relay must still process the unfollow
+		// instead of letting the public-distribution branch swallow it.
+		stubFederation();
+		const followBody = followActivity('https://remote.example/activities/follow-undo-public');
+		const signedFollow = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: followBody, privateKeyPem, keyId: REMOTE_KEY });
+		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedFollow, body: followBody });
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeTruthy();
+
+		const undoBody = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/undo-follow-public',
+			type: 'Undo',
+			actor: REMOTE_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: JSON.parse(followBody),
+		});
+		const signedUndo = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: undoBody, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedUndo, body: undoBody });
+		expect(response.status).toBe(202);
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('unsubscribed');
+	});
+
+	it('unsubscribes on Undo referencing the stored follow activity id', async () => {
+		stubFederation();
+		const followId = 'https://remote.example/activities/follow-undo-reference';
+		const followBody = followActivity(followId);
+		const signedFollow = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: followBody, privateKeyPem, keyId: REMOTE_KEY });
+		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedFollow, body: followBody });
+
+		const undoBody = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/undo-follow-reference',
+			type: 'Undo',
+			actor: REMOTE_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: followId,
+		});
+		const signedUndo = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: undoBody, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedUndo, body: undoBody });
+		expect(response.status).toBe(202);
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
 	});
 
 	it('does not fan out an activity that is only public in cc', async () => {

@@ -1,7 +1,11 @@
-import { SELF } from 'cloudflare:test';
+import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
+import { loadConfig } from '../src/config';
 
-const RELAY = 'https://relay.manalejandro.com';
+// Derive the relay identity from the configured environment so the suite
+// follows whatever RELAY_DOMAIN the deployment uses.
+const CONFIG = loadConfig(env as unknown as Parameters<typeof loadConfig>[0]);
+const RELAY = CONFIG.baseUrl;
 
 describe('relay HTTP surface', () => {
 	it('serves the actor document', async () => {
@@ -57,7 +61,7 @@ describe('relay HTTP surface', () => {
 		const status = (await response.json()) as Record<string, any>;
 		expect(status.schema_version).toBe(5);
 		expect(status.status).toBe('ok');
-		expect(status.domain).toBe('relay.manalejandro.com');
+		expect(status.domain).toBe(CONFIG.domain);
 		expect(status.registration).toBe('open');
 		expect(status.public_address_distribution_policy).toBe('explicit_public_only');
 		expect(status.endpoints).toEqual({ inbox: `${RELAY}/inbox`, actor: `${RELAY}/actor` });
@@ -69,10 +73,10 @@ describe('relay HTTP surface', () => {
 	});
 
 	it('serves WebFinger for the relay account', async () => {
-		const response = await SELF.fetch(`${RELAY}/.well-known/webfinger?resource=acct:relay@relay.manalejandro.com`);
+		const response = await SELF.fetch(`${RELAY}/.well-known/webfinger?resource=acct:relay@${CONFIG.domain}`);
 		expect(response.status).toBe(200);
 		const document = (await response.json()) as Record<string, any>;
-		expect(document.subject).toBe('acct:relay@relay.manalejandro.com');
+		expect(document.subject).toBe(`acct:relay@${CONFIG.domain}`);
 		expect(document.links[0]).toEqual({ rel: 'self', type: 'application/activity+json', href: `${RELAY}/actor` });
 	});
 
