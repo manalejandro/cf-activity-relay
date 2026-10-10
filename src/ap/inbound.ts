@@ -18,7 +18,6 @@ import {
 	deletePending,
 	deleteSubscriber,
 	getFollower,
-	getSubscriber,
 	isBlocked,
 	isLimited,
 	isSubscriberOrFollower,
@@ -519,36 +518,6 @@ function unwrapInnerFollow(object: unknown): Record<string, unknown> | null {
 	return object;
 }
 
-/**
- * Resolves the Follow an `Undo` refers to.
- *
- * Most implementations embed the original Follow activity. Some reference it
- * by its activity id instead, which is matched against the id stored when the
- * subscription was accepted, so an unrelated `Undo{Announce}` can never cancel
- * a subscription by accident.
- */
-async function resolveUndoFollow(ctx: InboundContext): Promise<Record<string, unknown> | null> {
-	const embedded = unwrapInnerFollow(ctx.activity.object);
-	if (embedded) return embedded;
-	if (typeof ctx.activity.object !== 'string' || !ctx.activity.object) return null;
-	const domain = hostOf(ctx.actor.id);
-	const [subscriber, follower] = await Promise.all([getSubscriber(ctx.env.DB, domain), getFollower(ctx.env.DB, domain)]);
-	if (subscriber && subscriber.activityId === ctx.activity.object) return { type: 'Follow', object: PUBLIC_ADDRESS };
-	if (follower && follower.activityId === ctx.activity.object) return { type: 'Follow', object: ctx.config.actorId };
-	return null;
-}
-
-/**
- * Handles an `Undo`, accepting both the embedded and the referenced Follow
- * shapes. A public audience on the Undo must not stop the relay from
- * processing the unfollow.
- */
-async function executeUndo(ctx: InboundContext): Promise<InboundResponse> {
-	const innerFollow = await resolveUndoFollow(ctx);
-	if (!innerFollow) return { status: 202, reason: 'unsupported-undo' };
-	return executeUnfollowing(ctx, innerFollow);
-}
-
 async function finalizeMutuallyFollow(ctx: InboundContext): Promise<InboundResponse> {
 	const inner = ctx.activity.object;
 	if (!isEmbeddedObject(inner)) return { status: 202 };
@@ -582,8 +551,6 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 				return executeRelayActivity(ctx);
 			case 'Announce':
 				return executePublicAnnounce(ctx);
-			case 'Undo':
-				return executeUndo(ctx);
 			default:
 				return { status: 202 };
 		}
@@ -593,8 +560,10 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 		switch (ctx.activity.type) {
 			case 'Follow':
 				return executeFollowing(ctx);
-			case 'Undo':
-				return executeUndo(ctx);
+			case 'Undo': {
+				const innerFollow = unwrapInnerFollow(ctx.activity.object);
+				return innerFollow ? executeUnfollowing(ctx, innerFollow) : { status: 202 };
+			}
 			case 'Accept':
 			case 'Reject':
 				return finalizeMutuallyFollow(ctx);
@@ -616,8 +585,10 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	switch (ctx.activity.type) {
 		case 'Follow':
 			return executeFollowing(ctx);
-		case 'Undo':
-			return executeUndo(ctx);
+		case 'Undo': {
+			const innerFollow = unwrapInnerFollow(ctx.activity.object);
+			return innerFollow ? executeUnfollowing(ctx, innerFollow) : { status: 202 };
+		}
 		default:
 			return { status: 202 };
 	}

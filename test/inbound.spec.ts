@@ -294,53 +294,6 @@ describe('inbound inbox processing', () => {
 		expect(publisher?.last_activity_type).toBe('Delete');
 	});
 
-	it('unsubscribes on Undo{Follow} addressed publicly', async () => {
-		// cf-activitypub-next adds `to: [Public]` to the Undo while the original
-		// Follow has no audience. The relay must still process the unfollow
-		// instead of letting the public-distribution branch swallow it.
-		stubFederation();
-		const followBody = followActivity('https://remote.example/activities/follow-undo-public');
-		const signedFollow = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: followBody, privateKeyPem, keyId: REMOTE_KEY });
-		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedFollow, body: followBody });
-		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeTruthy();
-
-		const undoBody = JSON.stringify({
-			'@context': 'https://www.w3.org/ns/activitystreams',
-			id: 'https://remote.example/activities/undo-follow-public',
-			type: 'Undo',
-			actor: REMOTE_ACTOR,
-			to: [PUBLIC_ADDRESS],
-			object: JSON.parse(followBody),
-		});
-		const signedUndo = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: undoBody, privateKeyPem, keyId: REMOTE_KEY });
-		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedUndo, body: undoBody });
-		expect(response.status).toBe(202);
-		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
-		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
-		expect(entry?.reason).toBe('unsubscribed');
-	});
-
-	it('unsubscribes on Undo referencing the stored follow activity id', async () => {
-		stubFederation();
-		const followId = 'https://remote.example/activities/follow-undo-reference';
-		const followBody = followActivity(followId);
-		const signedFollow = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: followBody, privateKeyPem, keyId: REMOTE_KEY });
-		await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedFollow, body: followBody });
-
-		const undoBody = JSON.stringify({
-			'@context': 'https://www.w3.org/ns/activitystreams',
-			id: 'https://remote.example/activities/undo-follow-reference',
-			type: 'Undo',
-			actor: REMOTE_ACTOR,
-			to: [PUBLIC_ADDRESS],
-			object: followId,
-		});
-		const signedUndo = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body: undoBody, privateKeyPem, keyId: REMOTE_KEY });
-		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signedUndo, body: undoBody });
-		expect(response.status).toBe(202);
-		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
-	});
-
 	it('does not fan out an activity that is only public in cc', async () => {
 		stubFederation();
 		const body = JSON.stringify({

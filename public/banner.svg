@@ -46,8 +46,7 @@
 	</g>
 	<text x="512" y="208" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="82" font-weight="bold" fill="#ffffff">cf-activity-relay</text>
 	<text x="516" y="278" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="34" fill="#a5b4fc">A public ActivityPub relay running on Cloudflare Workers</text>
-	<text x="516" y="344" font-family="DejaVu Sans Mono, Consolas, monospace" font-size="30" fill="#67e8f9">relay.manalejandro.com</text>
-	<g transform="translate(516, 382)">
+	<g transform="translate(516, 336)">
 		<rect width="176" height="44" rx="22" fill="#ffffff" fill-opacity="0.10" stroke="#ffffff" stroke-opacity="0.24"/>
 		<text x="88" y="30" text-anchor="middle" font-family="DejaVu Sans, Verdana, Helvetica, Arial, sans-serif" font-size="22" fill="#e0e7ff">MIT licensed</text>
 	</g>
