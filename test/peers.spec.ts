@@ -19,6 +19,7 @@ const ORIGIN_ACTOR = 'https://origin.example/actor';
 const ORIGIN_INBOX = 'https://origin.example/inbox';
 const NOTE = 'https://origin.example/notes/5';
 const CREATE = 'https://origin.example/activities/9';
+const FLAKY_NOTE = 'https://origin.example/notes/flaky';
 
 const DOWN_INBOX = 'https://down.example/inbox';
 
@@ -26,8 +27,25 @@ let privateKeyPem = '';
 let publicKeyPem = '';
 
 function stubFederation(): ReturnType<typeof vi.fn> {
+	let flakyCalls = 0;
 	const mock = vi.fn(async (input: RequestInfo | URL) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+		// Origin edge caches can 404 a brand new object: fail twice, then serve.
+		if (url === FLAKY_NOTE) {
+			flakyCalls += 1;
+			if (flakyCalls <= 2) return new Response('{"error":"Not Found"}', { status: 404 });
+			return new Response(
+				JSON.stringify({
+					'@context': 'https://www.w3.org/ns/activitystreams',
+					id: `${FLAKY_NOTE}/activity`,
+					type: 'Create',
+					actor: ORIGIN_ACTOR,
+					to: [PUBLIC_ADDRESS],
+					object: { id: FLAKY_NOTE, type: 'Note', attributedTo: ORIGIN_ACTOR },
+				}),
+				{ headers: { 'Content-Type': 'application/activity+json' } },
+			);
+		}
 		if (url === PEER_ACTOR || url === ORIGIN_ACTOR) {
 			return new Response(
 				JSON.stringify({
@@ -259,6 +277,91 @@ describe('relay-to-relay peering', () => {
 			.first<{ body: string }>();
 		expect(payload).toBeTruthy();
 	});
+
+	it('forwards peer-relayed deletion notices with an intact LD signature', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://origin.example/activities/delete-7',
+			type: 'Delete',
+			actor: ORIGIN_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: NOTE,
+			signature: {
+				type: 'RsaSignature2017',
+				creator: `${ORIGIN_ACTOR}#main-key`,
+				created: '2026-10-28T00:00:00Z',
+				signatureValue: 'c2lnbmF0dXJl',
+			},
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PEER_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+
+		// The verbatim body reaches traditional subscribers; no fetch of the
+		// (deleted) object is attempted and no Announce wrapper is minted.
+		const payload = await env.DB.prepare('SELECT body FROM activity_payloads ORDER BY created_at DESC LIMIT 1').first<{ body: string }>();
+		expect(payload?.body).toBe(body);
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('forwarded-delete');
+	});
+
+	it('drops unsigned peer-relayed deletion notices', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://origin.example/activities/delete-8',
+			type: 'Delete',
+			actor: ORIGIN_ACTOR,
+			to: [PUBLIC_ADDRESS],
+			object: NOTE,
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PEER_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('delete-unverifiable');
+	});
+
+	it('retries transient 404s while chaining a peer wrapper', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://peer.example/activities/announce-flaky',
+			type: 'Announce',
+			actor: PEER_ACTOR,
+			object: FLAKY_NOTE,
+			to: [`${PEER_ACTOR}/followers`],
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PEER_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+		const payload = await env.DB.prepare('SELECT body FROM activity_payloads WHERE body LIKE ? ORDER BY created_at DESC LIMIT 1')
+			.bind('%notes/flaky%')
+			.first<{ body: string }>();
+		expect(payload).toBeTruthy();
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('chained');
+	}, 15000);
+
+	it('acknowledges without retrying when the referenced object is unfetchable', async () => {
+		stubFederation();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://peer.example/activities/announce-gone',
+			type: 'Announce',
+			actor: PEER_ACTOR,
+			object: 'https://origin.example/activities/gone',
+			to: [`${PEER_ACTOR}/followers`],
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PEER_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		// A missing origin object is unprocessable, not a client error: answer
+		// 202 so the peer does not retry it forever.
+		expect(response.status).toBe(202);
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('referenced-unfetchable');
+	}, 15000);
 
 	it('drops the peering and notifies the peer on unsubscribe', async () => {
 		stubFederation();

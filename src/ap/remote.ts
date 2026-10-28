@@ -11,6 +11,7 @@ import {
 	CAPABILITY_LEGACY_TTL_SECONDS,
 	CAPABILITY_RFC9421_TTL_SECONDS,
 	FETCH_TIMEOUT_MS,
+	MAX_ERROR_BODY_BYTES,
 	MAX_REMOTE_DOCUMENT_BYTES,
 	RELAY_SOFTWARE_NAME,
 	RELAY_SOFTWARE_VERSION,
@@ -344,15 +345,23 @@ export async function fetchRemoteJson(env: Env, config: RelayConfig, identity: R
 	try {
 		const { response } = await signedFetch(env, config, identity, url, { method: 'GET', scope: 'fetch' });
 		if (!response.ok) {
-			await discardBody(response);
+			const snippet = ((await readTextBounded(response, MAX_ERROR_BODY_BYTES)) ?? '').slice(0, 200);
+			console.warn('remote json fetch rejected', { host: hostOf(url), url, status: response.status, body: snippet });
 			return null;
 		}
 		const text = await readTextBounded(response, MAX_REMOTE_DOCUMENT_BYTES);
 		if (text === null) return null;
-		const raw: unknown = JSON.parse(text);
+		let raw: unknown;
+		try {
+			raw = JSON.parse(text);
+		} catch {
+			console.warn('remote json parse failed', { host: hostOf(url) });
+			return null;
+		}
 		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
 		return raw as Record<string, unknown>;
-	} catch {
+	} catch (error) {
+		console.warn('remote json fetch failed', { host: hostOf(url), error: error instanceof Error ? error.message : String(error) });
 		return null;
 	}
 }

@@ -451,6 +451,26 @@ async function executePublicAnnounce(ctx: InboundContext): Promise<InboundRespon
 	return { status: 202 };
 }
 
+/**
+ * Fetches a referenced object with bounded retries. Relays announce objects
+ * milliseconds after publication, and origin edge caches can answer 404 until
+ * the object propagates; a couple of short retries recover most of them.
+ */
+async function fetchReferencedObject(
+	env: Env,
+	config: RelayConfig,
+	identity: RelayIdentity,
+	url: string,
+): Promise<Record<string, unknown> | null> {
+	const delays = [1000, 2000];
+	for (let attempt = 0; ; attempt += 1) {
+		const doc = await fetchRemoteJson(env, config, identity, url);
+		if (doc) return doc;
+		if (attempt >= delays.length) return null;
+		await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+	}
+}
+
 async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
 	if (!(await isSubscriberOrFollower(ctx.env.DB, sourceDomain)) && !(await isActivePeer(ctx.env.DB, sourceDomain))) {
@@ -458,10 +478,16 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 	}
 	const referencedUrl = objectId(ctx.activity.object);
 	if (!referencedUrl) return { status: 202 };
-	const referenced = await fetchRemoteJson(ctx.env, ctx.config, ctx.identity, referencedUrl);
-	if (!referenced || typeof referenced.id !== 'string' || typeof referenced.actor !== 'string') {
-		return { status: 400, text: 'unable to fetch the announced activity' };
+	const referenced = await fetchReferencedObject(ctx.env, ctx.config, ctx.identity, referencedUrl);
+	if (!referenced || typeof referenced.id !== 'string') {
+		// Unfetchable objects are dropped, not rejected: a 4xx would only make
+		// the sender retry content whose origin is gone or unreachable.
+		return { status: 202, reason: 'referenced-unfetchable' };
 	}
+	// Servers that serve the object itself (Note) instead of the wrapping
+	// Create attribute it with `attributedTo` rather than `actor`.
+	const referencedActor = typeof referenced.actor === 'string' ? referenced.actor : asStringArray(referenced.attributedTo)[0];
+	if (!referencedActor) return { status: 202, reason: 'referenced-unfetchable' };
 	// Never amplify content the origin did not address to the public
 	// audience: relaying an unlisted or restricted object would punch through
 	// the public-address distribution policy and the origin's intent.
@@ -471,14 +497,15 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 		return { status: 202, reason: 'referenced-not-public' };
 	}
 	const canonicalHash = await sha256Hex(referenced.id);
-	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202 };
+	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202, reason: 'duplicate' };
 
-	const originDomain = hostOf(referenced.actor);
-	if (!originDomain) return { status: 202 };
+	const originDomain = hostOf(referencedActor);
+	if (!originDomain) return { status: 202, reason: 'referenced-bad-origin' };
 	const originFlags = await getDomainPolicyFlags(ctx.env.DB, originDomain);
 	if (originFlags.blocked) return { status: 401, text: `${originDomain} is blocked`, reason: 'blocked' };
-	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, referenced.actor);
-	if (!originActor || !(await isActorAbleToRelay(ctx, originActor))) return { status: 202 };
+	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, referencedActor);
+	if (!originActor) return { status: 202, reason: 'origin-actor-unresolved' };
+	if (!(await isActorAbleToRelay(ctx, originActor))) return { status: 202, reason: 'origin-not-relayable' };
 	await recordPublisher(ctx.env.DB, {
 		domain: originDomain,
 		actorId: originActor.id,
@@ -491,7 +518,7 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 		await releaseCanonical(ctx.env.DB, canonicalHash);
 		return { status: 401, text: `fan-out rejected: ${result.reason}`, reason: 'fanout' };
 	}
-	return { status: 202 };
+	return { status: 202, reason: 'chained' };
 }
 
 /**
@@ -509,10 +536,22 @@ async function executePeerRelayed(ctx: InboundContext): Promise<InboundResponse>
 	const peerFlags = await getDomainPolicyFlags(ctx.env.DB, peerDomain);
 	if (peerFlags.blocked) return { status: 401, text: `${peerDomain} is blocked`, reason: 'blocked' };
 
+	// Delete/Move notices reference objects that are gone or rewritten at the
+	// origin: there is nothing to fetch. An intact Linked-Data proof lets
+	// traditional subscribers verify the original author themselves, so those
+	// notices are forwarded verbatim; unsigned ones cannot be attributed.
+	if (ctx.activity.type === 'Delete' || ctx.activity.type === 'Move') {
+		if (!hasLinkedDataSignature(ctx.body)) {
+			return { status: 202, reason: ctx.activity.type === 'Delete' ? 'delete-unverifiable' : 'move-unverifiable' };
+		}
+		await enqueueToSubscribers(ctx.env, ctx.config, ctx.body, [peerDomain, hostOf(ctx.activity.actor ?? '')]);
+		return { status: 202, reason: ctx.activity.type === 'Delete' ? 'forwarded-delete' : 'forwarded-move' };
+	}
+
 	const referencedId = objectId(ctx.activity.object);
 	if (!referencedId) return { status: 202 };
-	const fetched = await fetchRemoteJson(ctx.env, ctx.config, ctx.identity, referencedId);
-	if (!fetched || typeof fetched.id !== 'string') return { status: 400, text: 'unable to fetch the relayed object' };
+	const fetched = await fetchReferencedObject(ctx.env, ctx.config, ctx.identity, referencedId);
+	if (!fetched || typeof fetched.id !== 'string') return { status: 202, reason: 'peer-object-unfetchable' };
 
 	// Unwrap Create/Update transport wrappers to the canonical object.
 	let canonical: Record<string, unknown> = fetched;
@@ -542,10 +581,11 @@ async function executePeerRelayed(ctx: InboundContext): Promise<InboundResponse>
 	const objectKey = await sha256Hex(`peer-object\u0000${canonicalId}`);
 	if (!(await reserveActivity(ctx.env.DB, objectKey))) return { status: 202, reason: 'duplicate' };
 	const canonicalHash = await sha256Hex(canonicalId);
-	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202 };
+	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202, reason: 'duplicate' };
 
 	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, attribution);
-	if (!originActor || !(await isActorAbleToRelay(ctx, originActor))) return { status: 202 };
+	if (!originActor) return { status: 202, reason: 'origin-actor-unresolved' };
+	if (!(await isActorAbleToRelay(ctx, originActor))) return { status: 202, reason: 'origin-not-relayable' };
 	await recordPublisher(ctx.env.DB, {
 		domain: originDomain,
 		actorId: originActor.id,
@@ -570,7 +610,7 @@ async function executePeerRelayed(ctx: InboundContext): Promise<InboundResponse>
 		await releaseCanonical(ctx.env.DB, canonicalHash);
 		return { status: 401, text: `fan-out rejected: ${result.reason}`, reason: 'fanout' };
 	}
-	return { status: 202 };
+	return { status: 202, reason: 'chained' };
 }
 
 async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
