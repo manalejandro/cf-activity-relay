@@ -19,6 +19,7 @@ import {
 	deleteSubscriber,
 	getDomainPolicyFlags,
 	getFollower,
+	getPeer,
 	isSubscriberOrFollower,
 	listFollowers,
 	listSubscribers,
@@ -31,6 +32,7 @@ import {
 	reserveCanonical,
 	reserveNonce,
 	setCapability,
+	setPeerStatus,
 	updateFollowerMutual,
 } from '../store/repo';
 import { asStringArray, hostOf, isDeliverableUrl, isEmbeddedObject, normalizeOrigin, objectId } from '../utils/domains';
@@ -60,6 +62,12 @@ interface InboundContext {
 	activity: APActivity;
 	actor: RemoteActor;
 	body: string;
+	/**
+	 * True when the HTTP signer is an upstream peer relay delivering
+	 * third-party content: the JSON actor differs from the signer and the
+	 * object must be re-verified against its origin before fan-out.
+	 */
+	relayed?: boolean;
 }
 
 type Verification = { ok: true; ctx: InboundContext } | { ok: false; reason: string; keyHost?: string; keyStatus?: number };
@@ -143,9 +151,17 @@ async function verifyLegacy(
 	if (!activity?.actor) return { ok: false, reason: 'malformed-activity', keyHost };
 	const actorDomain = hostOf(activity.actor);
 	if (!actorDomain) return { ok: false, reason: 'malformed-activity', keyHost };
-	if (hostOf(parsed.keyId) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
-	if (hostOf(signerActor.id) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
-	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== actorDomain) return { ok: false, reason: 'actor-binding', keyHost };
+	if (hostOf(parsed.keyId) !== hostOf(signerActor.id)) return { ok: false, reason: 'actor-binding', keyHost };
+	if (signerActor.publicKeyOwner && hostOf(signerActor.publicKeyOwner) !== hostOf(signerActor.id)) return { ok: false, reason: 'actor-binding', keyHost };
+
+	// Relay-to-relay: an upstream peer signs deliveries of third-party content.
+	// The signer/actor split is only accepted from active peers; the object is
+	// re-verified against its origin before any fan-out.
+	if (hostOf(signerActor.id) !== actorDomain) {
+		if (!(await isActivePeer(env.DB, hostOf(signerActor.id)))) return { ok: false, reason: 'actor-binding', keyHost };
+		const settings = await loadSettings(env, config);
+		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body, relayed: true } };
+	}
 
 	const actor = activity.actor === signerActor.id ? signerActor : await fetchRemoteActor(env, config, identity, activity.actor);
 	if (!actor || hostOf(actor.id) !== actorDomain) return { ok: false, reason: 'actor-unresolved', keyHost };
@@ -218,7 +234,15 @@ async function verifyRfc9421(
 			reason = 'actor-binding';
 			continue;
 		}
-		if (signerActor.publicKeyOwner !== activity.actor || signerActor.id !== activity.actor) {
+		// Relay-to-relay: upstream peers sign third-party content. Only active
+		// peers may present a signer/actor split; the object is re-verified
+		// against its origin before any fan-out.
+		const relayed = signerActor.id !== activity.actor;
+		if (relayed && !(await isActivePeer(env.DB, hostOf(signerActor.id)))) {
+			reason = 'actor-binding';
+			continue;
+		}
+		if (signerActor.publicKeyOwner !== (relayed ? signerActor.id : activity.actor)) {
 			reason = 'actor-binding';
 			continue;
 		}
@@ -245,7 +269,7 @@ async function verifyRfc9421(
 		}
 
 		const settings = await loadSettings(env, config);
-		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body } };
+		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body, relayed } };
 	}
 	return { ok: false, reason, keyHost, keyStatus };
 }
@@ -253,6 +277,12 @@ async function verifyRfc9421(
 async function loadSettings(env: Env, config: RelayConfig): Promise<RelaySettings> {
 	const stored = await loadRelaySettings(env.DB);
 	return stored ?? { personOnly: config.personOnly, manuallyAccept: config.manuallyAccept };
+}
+
+/** True when the domain is an upstream peer relay with an accepted subscription. */
+async function isActivePeer(db: D1Database, domain: string): Promise<boolean> {
+	const peer = await getPeer(db, domain);
+	return peer?.status === 'active';
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +441,11 @@ async function executePublicAnnounce(ctx: InboundContext): Promise<InboundRespon
 	const sourceDomain = hostOf(ctx.actor.id);
 	const flags = await getDomainPolicyFlags(ctx.env.DB, sourceDomain);
 	if (flags.blocked) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
+	// Peers may address their wrappers to the public collection: chain them
+	// through the referenced-Announce path (origin re-verification included).
+	if (typeof ctx.activity.object === 'string' && (await isActivePeer(ctx.env.DB, sourceDomain))) {
+		return executeRelayAddressedAnnounce(ctx);
+	}
 	const publisher = await recordPublisherActivity(ctx);
 	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 	return { status: 202 };
@@ -418,7 +453,7 @@ async function executePublicAnnounce(ctx: InboundContext): Promise<InboundRespon
 
 async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (!(await isSubscriberOrFollower(ctx.env.DB, sourceDomain))) {
+	if (!(await isSubscriberOrFollower(ctx.env.DB, sourceDomain)) && !(await isActivePeer(ctx.env.DB, sourceDomain))) {
 		return { status: 401, text: 'to use the relay service, please follow in advance', reason: 'not-subscribed' };
 	}
 	const referencedUrl = objectId(ctx.activity.object);
@@ -452,6 +487,85 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 		activityType: typeof referenced.type === 'string' ? referenced.type : 'Announce',
 	});
 	const result = await enqueueFanOut(ctx.env, ctx.config, JSON.stringify(relayAnnounce(ctx.config, referenced.id)), [sourceDomain, originDomain]);
+	if (!result.ok) {
+		await releaseCanonical(ctx.env.DB, canonicalHash);
+		return { status: 401, text: `fan-out rejected: ${result.reason}`, reason: 'fanout' };
+	}
+	return { status: 202 };
+}
+
+/**
+ * Content delivered by an upstream peer relay under the peer's HTTP signature
+ * (signer ≠ JSON actor). Nothing is trusted from the peer: the referenced
+ * object is fetched from its origin, its attribution and public audience are
+ * verified, and only then is it re-announced to this relay's receivers.
+ *
+ * Two de-duplication layers keep relay chains loop-free: a 24 h per-object
+ * reservation (survives the canonical guard window) and the 15 min canonical
+ * guard shared with the referenced-Announce path.
+ */
+async function executePeerRelayed(ctx: InboundContext): Promise<InboundResponse> {
+	const peerDomain = hostOf(ctx.actor.id);
+	const peerFlags = await getDomainPolicyFlags(ctx.env.DB, peerDomain);
+	if (peerFlags.blocked) return { status: 401, text: `${peerDomain} is blocked`, reason: 'blocked' };
+
+	const referencedId = objectId(ctx.activity.object);
+	if (!referencedId) return { status: 202 };
+	const fetched = await fetchRemoteJson(ctx.env, ctx.config, ctx.identity, referencedId);
+	if (!fetched || typeof fetched.id !== 'string') return { status: 400, text: 'unable to fetch the relayed object' };
+
+	// Unwrap Create/Update transport wrappers to the canonical object.
+	let canonical: Record<string, unknown> = fetched;
+	if ((fetched.type === 'Create' || fetched.type === 'Update') && isEmbeddedObject(fetched.object)) {
+		const inner = fetched.object as Record<string, unknown>;
+		if (typeof inner.id === 'string') canonical = inner;
+	}
+	const canonicalId = typeof canonical.id === 'string' ? canonical.id : fetched.id;
+	const originDomain = hostOf(canonicalId);
+	if (!originDomain) return { status: 202 };
+
+	// Attribution: the object must belong to the domain that hosts it.
+	const attribution = asStringArray(canonical.attributedTo)[0] ?? asStringArray(canonical.actor)[0] ?? '';
+	if (!attribution || hostOf(attribution) !== originDomain) return { status: 202, reason: 'attribution-mismatch' };
+
+	// Audience: only genuinely public content travels through the chain.
+	const activityTo = asStringArray(fetched.to);
+	const activityCc = asStringArray(fetched.cc);
+	const to = activityTo.length > 0 ? activityTo : asStringArray(canonical.to);
+	const cc = activityCc.length > 0 ? activityCc : asStringArray(canonical.cc);
+	if (!allowsPublicAddress(to, cc, ctx.config.publicAddressPolicy)) return { status: 202, reason: 'referenced-not-public' };
+
+	const originFlags = await getDomainPolicyFlags(ctx.env.DB, originDomain);
+	if (originFlags.blocked) return { status: 401, text: `${originDomain} is blocked`, reason: 'blocked' };
+
+	// Loop protection: one re-announcement per canonical object per window.
+	const objectKey = await sha256Hex(`peer-object\u0000${canonicalId}`);
+	if (!(await reserveActivity(ctx.env.DB, objectKey))) return { status: 202, reason: 'duplicate' };
+	const canonicalHash = await sha256Hex(canonicalId);
+	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202 };
+
+	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, attribution);
+	if (!originActor || !(await isActorAbleToRelay(ctx, originActor))) return { status: 202 };
+	await recordPublisher(ctx.env.DB, {
+		domain: originDomain,
+		actorId: originActor.id,
+		inboxUrl: originActor.sharedInbox ?? originActor.inbox ?? null,
+		activityId: canonicalId,
+		activityType: typeof canonical.type === 'string' ? canonical.type : 'Note',
+	});
+
+	const preserveOriginal = hasLinkedDataSignature(ctx.body);
+	const announce = JSON.stringify(relayAnnounce(ctx.config, canonicalId));
+	let result: { ok: boolean; queued: number; reason?: 'fanout_limit' | 'queue_full' | 'broker' };
+	if (preserveOriginal) {
+		// The intact Linked-Data proof lets traditional subscribers verify the
+		// original author themselves; followers get the relay wrapper.
+		await enqueueToSubscribers(ctx.env, ctx.config, ctx.body, [peerDomain, originDomain]);
+		const subscribers = await listSubscribers(ctx.env.DB);
+		result = await enqueueToFollowers(ctx.env, ctx.config, announce, [peerDomain, originDomain, ...subscribers.map((subscriber) => subscriber.domain)]);
+	} else {
+		result = await enqueueFanOut(ctx.env, ctx.config, announce, [peerDomain, originDomain]);
+	}
 	if (!result.ok) {
 		await releaseCanonical(ctx.env.DB, canonicalHash);
 		return { status: 401, text: `fan-out rejected: ${result.reason}`, reason: 'fanout' };
@@ -540,7 +654,10 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 			actorId: ctx.actor.id,
 		});
 		await sendReply(ctx, 'Accept', inbox);
-		if (!flags.limited) {
+		// Never re-follow a domain we already subscribe to as a peer: the
+		// reciprocal Follow would otherwise ping-pong forever between relays.
+		const peer = await getPeer(ctx.env.DB, actorDomain);
+		if (!flags.limited && !peer) {
 			await sendActivity(ctx, ctx.actor.inbox, JSON.stringify(relayFollow(ctx.config, ctx.actor.id)));
 		}
 		return { status: 202, reason: 'followed' };
@@ -583,14 +700,31 @@ function unwrapInnerFollow(object: unknown): Record<string, unknown> | null {
 
 async function finalizeMutuallyFollow(ctx: InboundContext): Promise<InboundResponse> {
 	const inner = ctx.activity.object;
+	const innerId = objectId(inner);
+	const actorDomain = hostOf(ctx.actor.id);
+	// Response to one of our outbound peer-subscription Follows. Checked
+	// first: a peer Accept embeds our Follow whose object is the peer actor,
+	// which looks exactly like a mutual-follow response.
+	const peer = await getPeer(ctx.env.DB, actorDomain);
+	if (peer && innerId && innerId === peer.followId) {
+		await setPeerStatus(ctx.env.DB, actorDomain, ctx.activity.type === 'Accept' ? 'active' : 'rejected');
+		if (ctx.activity.type === 'Accept') await updateFollowerMutual(ctx.env.DB, actorDomain, true);
+		return { status: 202, reason: ctx.activity.type === 'Accept' ? 'peer-active' : 'peer-rejected' };
+	}
 	if (!isEmbeddedObject(inner)) return { status: 202 };
 	if (inner.type !== 'Follow') return { status: 202 };
 	if (inner.actor !== ctx.config.actorId) return { status: 202 };
-	if (inner.object !== ctx.actor.id) return { status: 202 };
-	const actorDomain = hostOf(ctx.actor.id);
-	const follower = await getFollower(ctx.env.DB, actorDomain);
-	if (!follower) return { status: 202 };
-	await updateFollowerMutual(ctx.env.DB, actorDomain, ctx.activity.type === 'Accept');
+	if (inner.object === ctx.actor.id) {
+		const follower = await getFollower(ctx.env.DB, actorDomain);
+		if (!follower) return { status: 202 };
+		await updateFollowerMutual(ctx.env.DB, actorDomain, ctx.activity.type === 'Accept');
+		return { status: 202 };
+	}
+	// Peers that reference our Follow by value instead of by id.
+	if (peer && (inner.object === peer.actorId || (peer.style === 'traditional' && inner.object === PUBLIC_ADDRESS))) {
+		await setPeerStatus(ctx.env.DB, actorDomain, ctx.activity.type === 'Accept' ? 'active' : 'rejected');
+		return { status: 202, reason: ctx.activity.type === 'Accept' ? 'peer-active' : 'peer-rejected' };
+	}
 	return { status: 202 };
 }
 
@@ -608,6 +742,22 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	const to = asStringArray(ctx.activity.to);
 	const cc = asStringArray(ctx.activity.cc);
 	const policy = ctx.config.publicAddressPolicy;
+
+	// Content arriving through an upstream peer relay: re-verify at the origin
+	// and re-announce; subscription traffic from the peer follows the normal
+	// paths below (there the signer is the actor).
+	if (ctx.relayed) {
+		switch (ctx.activity.type) {
+			case 'Create':
+			case 'Update':
+			case 'Delete':
+			case 'Move':
+			case 'Announce':
+				return executePeerRelayed(ctx);
+			default:
+				return { status: 202 };
+		}
+	}
 
 	if (allowsPublicAddress(to, cc, policy)) {
 		switch (ctx.activity.type) {
@@ -641,6 +791,12 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 			default:
 				return { status: 202 };
 		}
+	}
+
+	// Upstream peers address their Announce wrappers to their own audience or
+	// to this relay: chain them after re-verifying the referenced object.
+	if (ctx.activity.type === 'Announce' && (await isActivePeer(ctx.env.DB, hostOf(ctx.actor.id)))) {
+		return executeRelayAddressedAnnounce(ctx);
 	}
 
 	if (excludesPublicOnlyInCc(to, cc, policy)) {

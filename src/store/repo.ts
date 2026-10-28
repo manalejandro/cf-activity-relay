@@ -1,4 +1,4 @@
-import type { PendingRequest, Publisher, Receiver, ReceiverHealth, RelaySettings } from '../types';
+import type { PeerRelay, PendingRequest, Publisher, Receiver, ReceiverHealth, RelaySettings } from '../types';
 
 const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS relay_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
@@ -15,6 +15,7 @@ const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS signature_capabilities (origin TEXT NOT NULL, scope TEXT NOT NULL, profile TEXT NOT NULL, observed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (origin, scope))`,
 	`CREATE TABLE IF NOT EXISTS delivered_activities (activity_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS inbound_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, type TEXT NOT NULL, actor_domain TEXT NOT NULL, activity_id TEXT, status INTEGER NOT NULL, reason TEXT)`,
+	`CREATE TABLE IF NOT EXISTS peer_relays (domain TEXT PRIMARY KEY, actor_id TEXT NOT NULL, inbox_url TEXT NOT NULL, style TEXT NOT NULL, status TEXT NOT NULL, follow_id TEXT NOT NULL, created_at TEXT NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS idx_payloads_created ON activity_payloads (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_canonical_created ON canonical_activities (created_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_nonces_created ON signature_nonces (created_at)`,
@@ -420,6 +421,64 @@ export async function putPending(db: D1Database, request: PendingRequest): Promi
 
 export async function deletePending(db: D1Database, domain: string): Promise<void> {
 	await db.prepare('DELETE FROM pending_requests WHERE domain = ?').bind(domain).run();
+}
+
+// ---------------------------------------------------------------------------
+// Upstream peer relays
+// ---------------------------------------------------------------------------
+
+interface PeerRow {
+	domain: string;
+	actor_id: string;
+	inbox_url: string;
+	style: string;
+	status: string;
+	follow_id: string;
+	created_at: string;
+}
+
+function toPeer(row: PeerRow): PeerRelay {
+	return {
+		domain: row.domain,
+		actorId: row.actor_id,
+		inboxUrl: row.inbox_url,
+		style: row.style === 'traditional' ? 'traditional' : 'follower',
+		status: row.status === 'active' || row.status === 'rejected' ? row.status : 'pending',
+		followId: row.follow_id,
+		createdAt: row.created_at,
+	};
+}
+
+export async function listPeers(db: D1Database): Promise<PeerRelay[]> {
+	const rows = await db.prepare('SELECT domain, actor_id, inbox_url, style, status, follow_id, created_at FROM peer_relays ORDER BY domain').all<PeerRow>();
+	return (rows.results ?? []).map(toPeer);
+}
+
+export async function getPeer(db: D1Database, domain: string): Promise<PeerRelay | null> {
+	const row = await db
+		.prepare('SELECT domain, actor_id, inbox_url, style, status, follow_id, created_at FROM peer_relays WHERE domain = ?')
+		.bind(domain)
+		.first<PeerRow>();
+	return row ? toPeer(row) : null;
+}
+
+export async function putPeer(db: D1Database, peer: PeerRelay): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO peer_relays (domain, actor_id, inbox_url, style, status, follow_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(domain) DO UPDATE SET actor_id = excluded.actor_id, inbox_url = excluded.inbox_url, style = excluded.style, status = excluded.status, follow_id = excluded.follow_id`,
+		)
+		.bind(peer.domain, peer.actorId, peer.inboxUrl, peer.style, peer.status, peer.followId, peer.createdAt)
+		.run();
+}
+
+export async function setPeerStatus(db: D1Database, domain: string, status: 'pending' | 'active' | 'rejected'): Promise<boolean> {
+	const result = await db.prepare('UPDATE peer_relays SET status = ? WHERE domain = ?').bind(status, domain).run();
+	return (result.meta?.changes ?? 0) > 0;
+}
+
+export async function deletePeer(db: D1Database, domain: string): Promise<void> {
+	await db.prepare('DELETE FROM peer_relays WHERE domain = ?').bind(domain).run();
 }
 
 // ---------------------------------------------------------------------------

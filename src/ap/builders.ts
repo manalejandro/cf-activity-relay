@@ -62,7 +62,7 @@ export function reciprocalFollowId(config: RelayConfig, remoteActorId: string): 
 }
 
 /** `Undo` of the relay's reciprocal Follow, sent when a receiver is dropped. */
-export function relayUndoFollow(config: RelayConfig, remoteActorId: string): APActivity {
+export function relayUndoFollow(config: RelayConfig, remoteActorId: string, followObject: string = remoteActorId): APActivity {
 	return {
 		'@context': [ACTIVITY_STREAMS_CONTEXT],
 		id: newActivityId(config),
@@ -73,9 +73,25 @@ export function relayUndoFollow(config: RelayConfig, remoteActorId: string): APA
 			id: reciprocalFollowId(config, remoteActorId),
 			type: 'Follow',
 			actor: config.actorId,
-			object: remoteActorId,
+			object: followObject,
 		},
 		to: [remoteActorId],
+	};
+}
+
+/**
+ * Outbound subscription Follow to an upstream peer relay. The identifier is
+ * the deterministic per-domain Follow id so retries, the reciprocal handshake
+ * and the later `Undo` all reference the same logical activity.
+ */
+export function peerFollow(config: RelayConfig, peerActorId: string, style: 'follower' | 'traditional'): APActivity {
+	return {
+		'@context': [ACTIVITY_STREAMS_CONTEXT],
+		id: reciprocalFollowId(config, peerActorId),
+		actor: config.actorId,
+		type: 'Follow',
+		object: style === 'traditional' ? PUBLIC_ADDRESS : peerActorId,
+		to: [peerActorId],
 	};
 }
 

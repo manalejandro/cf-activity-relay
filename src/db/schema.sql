@@ -106,6 +106,16 @@ CREATE TABLE IF NOT EXISTS inbound_log (
 	reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS peer_relays (
+	domain TEXT PRIMARY KEY,
+	actor_id TEXT NOT NULL,
+	inbox_url TEXT NOT NULL,
+	style TEXT NOT NULL,
+	status TEXT NOT NULL,
+	follow_id TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_payloads_created ON activity_payloads (created_at);
 CREATE INDEX IF NOT EXISTS idx_canonical_created ON canonical_activities (created_at);
 CREATE INDEX IF NOT EXISTS idx_nonces_created ON signature_nonces (created_at);

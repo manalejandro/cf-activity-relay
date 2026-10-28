@@ -73,3 +73,18 @@ export interface RelaySettings {
 	personOnly: boolean;
 	manuallyAccept: boolean;
 }
+
+/**
+ * An upstream relay this relay subscribes to for wider federation.
+ * `style` is the subscription handshake used: `follower` (Follow of the peer
+ * actor, mutual) or `traditional` (Follow of the Public collection).
+ */
+export interface PeerRelay {
+	domain: string;
+	actorId: string;
+	inboxUrl: string;
+	style: 'follower' | 'traditional';
+	status: 'pending' | 'active' | 'rejected';
+	followId: string;
+	createdAt: string;
+}

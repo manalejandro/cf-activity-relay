@@ -30,6 +30,7 @@ It implements the same federation model as the Go [Activity-Relay](https://githu
 - **Abuse controls**: blocked and limited domain lists, person-only policy, manual approval with a pending queue, per-domain receiver health.
 - **Bounded fan-out** with `MAX_FANOUT_TARGETS` and `MAX_QUEUE_JOBS`, domain de-duplication, and shared payloads that survive partial delivery failure.
 - **Public status document** at `/status.json` (schema version 5) with connected instances, receiving instances, delivery health and publisher metadata.
+- **Relay-to-relay peering**: subscribe to upstream relays (mutual follower-style or traditional `Follow(Public)`) and chain their public content onwards after re-verifying every object at its origin.
 - **WebFinger, NodeInfo 2.1**, empty privacy-filtered collections and a small landing page with live status.
 - **Zero-cost cold start identity**: the relay RSA key is generated on first request and persisted in D1, or supplied as a secret.
 
@@ -60,14 +61,14 @@ It implements the same federation model as the Go [Activity-Relay](https://githu
 
 | Binding | Product | Purpose |
 | --- | --- | --- |
-| `DB` | D1 | Relay identity, subscribers, followers, pending requests, publishers, blocked/limited domains, receiver health, queued payloads, nonces, capability evidence. |
+| `DB` | D1 | Relay identity, subscribers, followers, pending requests, upstream peer relays, publishers, blocked/limited domains, receiver health, queued payloads, nonces, capability evidence. |
 | `CACHE` | KV | Remote actor documents (5 min) and negative lookup cache. |
 | `DELIVERY_QUEUE` | Queues | One message per fan-out target plus a dead-letter queue. |
 | `ASSETS` | Static assets | Landing page, logo, banner. |
 
 ### D1 tables
 
-`relay_config`, `subscribers`, `followers`, `pending_requests`, `publishers`, `blocked_domains`, `limited_domains`, `receiver_health`, `activity_payloads`, `canonical_activities`, `signature_nonces`, `signature_capabilities`, `delivered_activities`.
+`relay_config`, `subscribers`, `followers`, `pending_requests`, `peer_relays`, `publishers`, `blocked_domains`, `limited_domains`, `receiver_health`, `activity_payloads`, `canonical_activities`, `signature_nonces`, `signature_capabilities`, `delivered_activities`, `inbound_log`.
 
 The Worker applies the idempotent schema on cold start, so a fresh deployment works without a manual migration. `npm run db:migrate` is available for pre-provisioning.
 
@@ -174,6 +175,25 @@ curl -s "https://relay.example.org/.well-known/webfinger?resource=acct:relay@rel
 
 `PERSON_ONLY` and `MANUALLY_ACCEPT` are runtime settings: the environment variables provide the initial value and the admin API can change them afterwards. The D1 values win.
 
+## Relay-to-relay peering
+
+A relay can subscribe to **upstream relays** so public content travels further than one hop. Peering is operator-driven through the admin API (`POST /admin/peers/subscribe`) and stored in `peer_relays` with a `pending → active|rejected` lifecycle.
+
+Two handshake styles are supported, mirroring the two subscription families:
+
+- **`follower` (default)** — the relay follows the peer's *actor*. The peer answers `Accept` (which activates the peer) and usually sends a reciprocal `Follow`, making the peering **mutual**: both relays then receive each other's `Announce` wrappers.
+- **`traditional`** — the relay sends `Follow(object=Public)` to the peer's inbox. Peers of the Activity-Relay family then forward raw publisher bodies to this relay's inbox.
+
+Inbound content whose HTTP signer differs from the JSON actor is accepted **only from active peers**, and nothing is trusted from the peer: the referenced object is fetched from its origin, its attribution (`id` host = `attributedTo`/`actor` host) and its public audience are verified against `PUBLIC_ADDRESS_DISTRIBUTION_POLICY`, and only then is it re-announced to this relay's receivers (raw bodies with an intact `RsaSignature2017` are additionally forwarded byte-for-byte to traditional subscribers).
+
+Loop safety across relay chains:
+
+- a 24 h per-object reservation (`delivered_activities`, keyed `hash("peer-object‖<object id>")`) so the same canonical object is never re-announced twice through a peer, on top of the 15 min canonical guard;
+- the supplying peer and the origin domain are always excluded from the fan-out;
+- `Undo` of both directions is sent on `POST /admin/peers/unsubscribe`, and blocking a peer domain stops chaining immediately.
+
+Peers appear in `GET /admin/state` and `GET /admin/peers`.
+
 ## Admin API
 
 The relay ships a small dashboard at **`/admin/`** that asks for the admin token, keeps it in the browser tab (`sessionStorage`) and drives every endpoint below. It shows live counts, settings, pending requests, receivers, publishers, the inbound audit trail and the domain policy, and it can accept/reject requests, add or remove receivers, block or limit domains, broadcast an actor `Update` and switch the runtime policies.
@@ -182,8 +202,11 @@ The API is enabled only when `ADMIN_TOKEN` is set. Every request needs `Authoriz
 
 | Request | Description |
 | --- | --- |
-| `GET /admin/state` | Subscribers, followers, pending requests, publishers, blocked/limited lists, counts and settings. |
+| `GET /admin/state` | Subscribers, followers, pending requests, peers, publishers, blocked/limited lists, counts and settings. |
 | `GET /admin/log?limit=50` | Recent inbound events (type, actor domain, activity ID, status, reason). Retained for 7 days. |
+| `GET /admin/peers` | Upstream peer relays with style and lifecycle status. |
+| `POST /admin/peers/subscribe` | Body `{"relay":"https://peer.example/actor","style":"follower"}` (`style` optional, `follower` or `traditional`). Resolves the peer actor, stores a `pending` peer and sends the subscription `Follow`. |
+| `POST /admin/peers/unsubscribe` | Body `{"domain":"peer.example"}`. Sends `Undo` for both directions of a mutual peering and removes peer/receiver records. |
 | `POST /admin/subscribe` | Body `{"actor":"https://instance.example/actor"}`. Resolves the actor's shared inbox and registers it as a traditional receiver. |
 | `POST /admin/unsubscribe` | Body `{"domain":"instance.example"}`. Removes the subscriber, follower and pending records for that domain. |
 | `POST /admin/pending/:domain/accept` | Approve a pending follow: stores the receiver, sends `Accept` and the reciprocal `Follow` for follower-style requests. |
@@ -206,6 +229,9 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
 curl -s -X POST -H "Authorization: Bearer $TOKEN" https://relay.example.org/admin/pending/mastodon.example/accept | jq .
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 	-d '{"manuallyAccept":true}' https://relay.example.org/admin/settings | jq .
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+	-d '{"relay":"https://peer.example/actor"}' https://relay.example.org/admin/peers/subscribe | jq .
+curl -s -H "Authorization: Bearer $TOKEN" https://relay.example.org/admin/peers | jq .
 ```
 
 ## Who can subscribe

@@ -517,6 +517,26 @@
 				</article>
 
 				<article class="card">
+					<h2>Peer relays</h2>
+					<p class="card-sub">Upstream relays this relay subscribes to. Content arriving from an active peer is re-verified at its origin before being re-announced.</p>
+					<div id="peers-table"></div>
+					<form class="field" id="peer-form" style="margin-top: 18px">
+						<div class="grow">
+							<label for="peer-relay">Peer relay actor</label>
+							<input id="peer-relay" type="url" placeholder="https://relay.example.org/actor" spellcheck="false" required />
+						</div>
+						<div>
+							<label for="peer-style">Style</label>
+							<select id="peer-style">
+								<option value="follower" selected>follower (mutual)</option>
+								<option value="traditional">traditional</option>
+							</select>
+						</div>
+						<button class="button primary" type="submit">Connect</button>
+					</form>
+				</article>
+
+				<article class="card">
 					<h2>Domain policy</h2>
 					<p class="card-sub">Blocked domains are rejected with <span class="mono">401</span>. Limited domains are silently skipped and never receive a reciprocal follow.</p>
 					<form class="field" id="domain-form">
@@ -708,6 +728,7 @@
 					['Subscribers', counts.subscribers],
 					['Followers', counts.followers],
 					['Pending', counts.pending],
+					['Peers', counts.peers || 0],
 					['Publishers', counts.publishers],
 					['Blocked', counts.blocked],
 					['Limited', counts.limited],
@@ -776,6 +797,26 @@
 				);
 			}
 
+			function renderPeers(peers) {
+				$('peers-table').replaceChildren(
+					table(
+						['Domain', 'Actor', 'Style', 'Status', ''],
+						peers.map((peer) =>
+							el('tr', {}, [
+								el('td', { class: 'mono', text: peer.domain }),
+								el('td', { class: 'mono', text: peer.actorId }),
+								el('td', { text: peer.style }),
+								el('td', {}, [pill(peer.status, peer.status === 'active' ? 'ok' : peer.status === 'pending' ? 'warn' : 'bad')]),
+								el('td', { class: 'actions' }, [
+									actionButton('Disconnect', () => act('peers/unsubscribe', 'Disconnected ' + peer.domain, { domain: peer.domain }), 'danger'),
+								]),
+							])
+						),
+						'No upstream peers.'
+					)
+				);
+			}
+
 			function renderDomains(blocked, limited) {
 				const rows = (list, action, label) =>
 					list.map((domain) =>
@@ -839,6 +880,7 @@
 					renderSettings(state.settings || {});
 					renderPending(state.pending || []);
 					renderReceivers(state);
+					renderPeers(state.peers || []);
 					renderDomains(state.blocked || [], state.limited || []);
 					renderPublishers(state.publishers || []);
 					renderLog((log && log.entries) || []);
@@ -904,6 +946,15 @@
 				if (!actor) return;
 				await act('subscribe', 'Subscribed ' + actor, { actor });
 				$('subscribe-actor').value = '';
+			});
+
+			$('peer-form').addEventListener('submit', async (event) => {
+				event.preventDefault();
+				const relay = $('peer-relay').value.trim();
+				const style = $('peer-style').value;
+				if (!relay) return;
+				await act('peers/subscribe', 'Peer subscription sent to ' + relay, { relay, style });
+				$('peer-relay').value = '';
 			});
 
 			$('domain-form').addEventListener('submit', async (event) => {

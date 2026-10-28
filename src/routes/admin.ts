@@ -7,7 +7,7 @@
 import { PUBLIC_ADDRESS, type RelayConfig } from '../config';
 import type { Env } from '../env';
 import { buildRelayActor } from '../ap/actor';
-import { relayFollow, relayReply, relayUndoFollow, relayUpdate } from '../ap/builders';
+import { peerFollow, relayFollow, relayReply, relayUndoFollow, relayUpdate } from '../ap/builders';
 import { enqueueDeliveries, enqueueFanOut } from '../ap/fanout';
 import { timingSafeEqual } from '../crypto/digest';
 import {
@@ -17,6 +17,7 @@ import {
 	deletePending,
 	deleteSubscriber,
 	getFollower,
+	getPeer,
 	getPending,
 	isLimited,
 	listBlockedDomains,
@@ -24,14 +25,17 @@ import {
 	listInboundLog,
 	listLimitedDomains,
 	listPending,
+	listPeers,
 	listPublishers,
 	listSubscribers,
 	loadRelaySettings,
+	putPeer,
+	deletePeer,
 	saveRelaySettings,
 	setDomainPolicy,
 } from '../store/repo';
 import type { APActivity } from '../types';
-import { hostOf } from '../utils/domains';
+import { hostOf, isDeliverableUrl } from '../utils/domains';
 import { jsonResponse, notFound, readBodyBounded, textResponse } from '../utils/http';
 
 const ADMIN_BODY_LIMIT_BYTES = 64 * 1024;
@@ -133,7 +137,7 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 	}
 
 	if (section === 'state' && request.method === 'GET') {
-		const [subscribers, followers, pending, publishers, blocked, limited, settings] = await Promise.all([
+		const [subscribers, followers, pending, publishers, blocked, limited, settings, peers] = await Promise.all([
 			listSubscribers(env.DB),
 			listFollowers(env.DB),
 			listPending(env.DB),
@@ -141,6 +145,7 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 			listBlockedDomains(env.DB),
 			listLimitedDomains(env.DB),
 			loadRelaySettings(env.DB),
+			listPeers(env.DB),
 		]);
 		return jsonResponse({
 			domain: config.domain,
@@ -152,6 +157,7 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 				publishers: publishers.length,
 				blocked: blocked.length,
 				limited: limited.length,
+				peers: peers.length,
 			},
 			subscribers,
 			followers,
@@ -159,7 +165,69 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 			publishers,
 			blocked,
 			limited,
+			peers,
 		});
+	}
+
+	if (section === 'peers' && request.method === 'GET' && segments.length === 2) {
+		return jsonResponse({ peers: await listPeers(env.DB) });
+	}
+
+	if (section === 'peers' && request.method === 'POST' && segments.length === 3) {
+		const action = segments[2];
+		if (action === 'subscribe') {
+			// Subscribe this relay to an upstream relay so public content
+			// reaches both audiences. `follower` (default) follows the peer
+			// actor (mutual peering, Announce wrappers); `traditional` sends
+			// Follow(Public) to the peer inbox (raw forwarding).
+			const body = await readJsonBody(request);
+			if (body === null) return textResponse('invalid or oversized JSON body', 400);
+			const relayUrl = typeof body.relay === 'string' ? body.relay : '';
+			const style: 'follower' | 'traditional' = body.style === 'traditional' ? 'traditional' : 'follower';
+			if (!relayUrl) return textResponse('relay is required', 400);
+			const { getRelayIdentity } = await import('../ap/identity');
+			const { fetchRemoteActor } = await import('../ap/remote');
+			const identity = await getRelayIdentity(env, config);
+			const actor = await fetchRemoteActor(env, config, identity, relayUrl);
+			if (!actor) return textResponse('unable to resolve the peer relay actor', 404);
+			const inboxUrl = actor.sharedInbox ?? actor.inbox;
+			const domain = hostOf(actor.id);
+			if (!inboxUrl || !domain || !isDeliverableUrl(inboxUrl)) return textResponse('the peer has no usable inbox', 400);
+			if (domain === config.domain) return textResponse('cannot peer with this relay itself', 400);
+			const follow = peerFollow(config, actor.id, style);
+			await putPeer(env.DB, {
+				domain,
+				actorId: actor.id,
+				inboxUrl,
+				style,
+				status: 'pending',
+				followId: typeof follow.id === 'string' ? follow.id : '',
+				createdAt: new Date().toISOString(),
+			});
+			await enqueueDeliveries(env, config, JSON.stringify(follow), [inboxUrl]);
+			return jsonResponse({ status: 'pending', domain, style, follow: follow.id });
+		}
+		if (action === 'unsubscribe') {
+			const body = await readJsonBody(request);
+			if (body === null) return textResponse('invalid or oversized JSON body', 400);
+			const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase().replace(/\.$/, '') : '';
+			if (!domain) return textResponse('domain is required', 400);
+			const peer = await getPeer(env.DB, domain);
+			if (!peer) return textResponse('unknown peer', 404);
+			// Withdraw our subscription and, when the peering was mutual, the
+			// peer's subscription to us.
+			await enqueueDeliveries(env, config, JSON.stringify(relayUndoFollow(config, peer.actorId, peer.style === 'traditional' ? PUBLIC_ADDRESS : peer.actorId)), [peer.inboxUrl]);
+			const follower = await getFollower(env.DB, domain);
+			if (follower) {
+				await enqueueDeliveries(env, config, JSON.stringify(relayUndoFollow(config, follower.actorId)), [follower.inboxUrl]);
+			}
+			await deletePeer(env.DB, domain);
+			await deleteFollower(env.DB, domain);
+			await deleteSubscriber(env.DB, domain);
+			await deletePending(env.DB, domain);
+			return jsonResponse({ status: 'unpeered', domain });
+		}
+		return notFound();
 	}
 
 	if (section === 'pending' && segments.length === 4 && request.method === 'POST') {
