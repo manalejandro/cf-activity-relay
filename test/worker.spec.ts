@@ -12,6 +12,7 @@ describe('relay HTTP surface', () => {
 		const response = await SELF.fetch(`${RELAY}/actor`);
 		expect(response.status).toBe(200);
 		expect(response.headers.get('content-type')).toBe('application/activity+json');
+		expect(response.headers.get('cache-control')).toBe('public, max-age=60');
 		const actor = (await response.json()) as Record<string, any>;
 		expect(actor.id).toBe(`${RELAY}/actor`);
 		expect(actor.type).toBe('Application');
@@ -75,6 +76,9 @@ describe('relay HTTP surface', () => {
 	it('serves WebFinger for the relay account', async () => {
 		const response = await SELF.fetch(`${RELAY}/.well-known/webfinger?resource=acct:relay@${CONFIG.domain}`);
 		expect(response.status).toBe(200);
+		// RFC 7033 §4.2/§10.2: JRD media type, and §5: open CORS.
+		expect(response.headers.get('content-type')).toBe('application/jrd+json');
+		expect(response.headers.get('access-control-allow-origin')).toBe('*');
 		const document = (await response.json()) as Record<string, any>;
 		expect(document.subject).toBe(`acct:relay@${CONFIG.domain}`);
 		expect(document.links[0]).toEqual({ rel: 'self', type: 'application/activity+json', href: `${RELAY}/actor` });
@@ -88,11 +92,13 @@ describe('relay HTTP surface', () => {
 	it('serves NodeInfo discovery and 2.1 documents', async () => {
 		const discovery = await SELF.fetch(`${RELAY}/.well-known/nodeinfo`);
 		expect(discovery.status).toBe(200);
+		expect(discovery.headers.get('content-type')).toBe('application/jrd+json');
 		const links = (await discovery.json()) as Record<string, any>;
 		expect(links.links[0].href).toBe(`${RELAY}/nodeinfo/2.1`);
 
 		const nodeinfo = await SELF.fetch(`${RELAY}/nodeinfo/2.1`);
 		expect(nodeinfo.status).toBe(200);
+		expect(nodeinfo.headers.get('content-type')).toContain('profile="http://nodeinfo.diaspora.software/ns/schema/2.1#"');
 		const document = (await nodeinfo.json()) as Record<string, any>;
 		expect(document.version).toBe('2.1');
 		expect(document.software.name).toBe('cf-activity-relay');
@@ -102,5 +108,26 @@ describe('relay HTTP surface', () => {
 	it('answers health checks and unknown paths', async () => {
 		expect((await SELF.fetch(`${RELAY}/health`)).status).toBe(200);
 		expect((await SELF.fetch(`${RELAY}/does-not-exist`)).status).toBe(404);
+	});
+
+	it('serves status.json with more than 100 receiving domains', async () => {
+		// D1 binds at most 100 parameters per query: the health lookup must page.
+		for (let index = 0; index < 110; index += 1) {
+			await env.DB.prepare(
+				`INSERT INTO followers (domain, inbox_url, activity_id, actor_id, mutually_follow, created_at) VALUES (?, ?, ?, ?, 0, ?)
+				 ON CONFLICT(domain) DO NOTHING`,
+			)
+				.bind(`bulk-${index}.example`, `https://bulk-${index}.example/inbox`, `https://bulk-${index}.example/activities/f`, `https://bulk-${index}.example/actor`, new Date().toISOString())
+				.run();
+		}
+		try {
+			const response = await SELF.fetch(`${RELAY}/status.json`);
+			expect(response.status).toBe(200);
+			const status = (await response.json()) as Record<string, any>;
+			expect(status.receiving_instances.count).toBe(110);
+			expect(status.receiving_instances.entries).toHaveLength(110);
+		} finally {
+			await env.DB.prepare("DELETE FROM followers WHERE domain LIKE 'bulk-%.example'").run();
+		}
 	});
 });

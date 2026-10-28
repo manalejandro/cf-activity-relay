@@ -11,10 +11,15 @@ export const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 
 /** Maximum accepted body for a remote actor document (2 MiB). */
 export const MAX_REMOTE_DOCUMENT_BYTES = 2 * 1024 * 1024;
+/**
+ * Hard ceiling for `MAX_ACTIVITY_BYTES`: fan-out payloads are stored in a D1
+ * row, and D1 limits strings/rows to 2,000,000 bytes.
+ */
+export const MAX_ACTIVITY_BYTES_CEILING = 1_900_000;
 /** Maximum bytes of a remote error response kept for diagnostics. */
 export const MAX_ERROR_BODY_BYTES = 4096;
 /** Delivery request timeout. */
-export const DELIVERY_TIMEOUT_MS = 5000;
+export const DELIVERY_TIMEOUT_MS = 10000;
 /** Signed remote GET timeout. */
 export const FETCH_TIMEOUT_MS = 10000;
 /** Remote actor cache TTL in seconds. */
@@ -80,6 +85,15 @@ function normalizeDomain(value: string): string {
 	return value.trim().toLowerCase().replace(/\.$/, '');
 }
 
+/** Parses a comma separated operator supplied domain list. */
+export function parseDomainList(value: string | undefined): string[] {
+	if (!value) return [];
+	return value
+		.split(',')
+		.map((entry) => normalizeDomain(entry))
+		.filter((entry) => entry.length > 0 && /^[a-z0-9.-]+$/.test(entry));
+}
+
 /**
  * Loads the immutable relay configuration from the Worker environment.
  * Mutable settings (person-only, manual approval) live in D1 and are applied
@@ -107,7 +121,7 @@ export function loadConfig(env: Env): RelayConfig {
 		outboundProfile: profile,
 		personOnly: booleanValue(env.PERSON_ONLY),
 		manuallyAccept: booleanValue(env.MANUALLY_ACCEPT),
-		maxActivityBytes: positiveInt(env.MAX_ACTIVITY_BYTES, 1048576, 1024),
+		maxActivityBytes: Math.min(positiveInt(env.MAX_ACTIVITY_BYTES, 1048576, 1024), MAX_ACTIVITY_BYTES_CEILING),
 		maxFanoutTargets: positiveInt(env.MAX_FANOUT_TARGETS, 5000, 1),
 		maxQueueJobs: positiveInt(env.MAX_QUEUE_JOBS, 100000, 1),
 		adminToken: env.ADMIN_TOKEN?.trim() || undefined,

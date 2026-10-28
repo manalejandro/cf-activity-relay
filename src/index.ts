@@ -5,10 +5,10 @@
  * endpoints, processes inbound activities synchronously, and fans deliveries
  * out through Cloudflare Queues.
  */
-import { loadConfig, type RelayConfig } from './config';
+import { loadConfig, parseDomainList, type RelayConfig } from './config';
 import type { DeliveryMessage, Env } from './env';
 import { consumeDeliveryBatch } from './ap/delivery';
-import { cleanupExpired, ensureSchema } from './store/repo';
+import { cleanupExpired, ensureStartup } from './store/repo';
 import { handleActor, handleActorCollection } from './routes/actor';
 import { handleAdmin } from './routes/admin';
 import { handleInbox } from './routes/inbox';
@@ -64,7 +64,7 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		try {
-			await ensureSchema(env.DB);
+			await ensureStartup(env.DB, parseDomainList(env.BLOCKED_DOMAINS), parseDomainList(env.LIMITED_DOMAINS));
 			const config = loadConfig(env);
 			return await route(request, env, config, url);
 		} catch (error) {
@@ -77,12 +77,12 @@ export default {
 	},
 
 	async queue(batch: MessageBatch<DeliveryMessage>, env: Env): Promise<void> {
-		await ensureSchema(env.DB);
+		await ensureStartup(env.DB, parseDomainList(env.BLOCKED_DOMAINS), parseDomainList(env.LIMITED_DOMAINS));
 		await consumeDeliveryBatch(batch, env);
 	},
 
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-		await ensureSchema(env.DB);
+		await ensureStartup(env.DB, parseDomainList(env.BLOCKED_DOMAINS), parseDomainList(env.LIMITED_DOMAINS));
 		await cleanupExpired(env.DB);
 		console.log('scheduled cleanup completed', { cron: controller.cron });
 	},

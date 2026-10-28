@@ -1,5 +1,6 @@
 import { ACTIVITY_STREAMS_CONTEXT, PUBLIC_ADDRESS, type RelayConfig } from '../config';
 import type { APActivity } from '../types';
+import { hostOf } from '../utils/domains';
 
 /** Generates a stable, relay-scoped activity identifier. */
 export function newActivityId(config: RelayConfig): string {
@@ -10,6 +11,10 @@ export function newActivityId(config: RelayConfig): string {
  * Relay-authored `Announce` wrapper. The relay replaces a publisher transport
  * wrapper with its own signed reference to the canonical object so that the
  * HTTP signer and the JSON actor always agree.
+ *
+ * `published` and both audience fields are always present: some receivers
+ * reject Announces without `published` (FEP-ae0c) and Akkoma's announce
+ * validator requires `to` and `cc` to exist.
  */
 export function relayAnnounce(config: RelayConfig, objectId: string): APActivity {
 	return {
@@ -18,7 +23,9 @@ export function relayAnnounce(config: RelayConfig, objectId: string): APActivity
 		actor: config.actorId,
 		type: 'Announce',
 		object: objectId,
+		published: new Date().toISOString(),
 		to: [`${config.actorId}/followers`],
+		cc: [],
 	};
 }
 
@@ -38,10 +45,36 @@ export function relayReply(config: RelayConfig, activity: APActivity, type: 'Acc
 export function relayFollow(config: RelayConfig, remoteActorId: string): APActivity {
 	return {
 		'@context': [ACTIVITY_STREAMS_CONTEXT],
-		id: newActivityId(config),
+		id: reciprocalFollowId(config, remoteActorId),
 		actor: config.actorId,
 		type: 'Follow',
 		object: remoteActorId,
+		to: [remoteActorId],
+	};
+}
+
+/**
+ * Stable identifier of the reciprocal Follow for a domain. Deterministic so
+ * the relay can later `Undo` it (unsubscribe, block) without storing it.
+ */
+export function reciprocalFollowId(config: RelayConfig, remoteActorId: string): string {
+	return `${config.actorId}/follows/${hostOf(remoteActorId) || remoteActorId}`;
+}
+
+/** `Undo` of the relay's reciprocal Follow, sent when a receiver is dropped. */
+export function relayUndoFollow(config: RelayConfig, remoteActorId: string): APActivity {
+	return {
+		'@context': [ACTIVITY_STREAMS_CONTEXT],
+		id: newActivityId(config),
+		actor: config.actorId,
+		type: 'Undo',
+		object: {
+			'@context': [ACTIVITY_STREAMS_CONTEXT],
+			id: reciprocalFollowId(config, remoteActorId),
+			type: 'Follow',
+			actor: config.actorId,
+			object: remoteActorId,
+		},
 		to: [remoteActorId],
 	};
 }
@@ -54,6 +87,8 @@ export function relayUpdate(config: RelayConfig, actor: Record<string, unknown>)
 		actor: config.actorId,
 		type: 'Update',
 		object: actor,
+		published: new Date().toISOString(),
 		to: [PUBLIC_ADDRESS],
+		cc: [],
 	};
 }

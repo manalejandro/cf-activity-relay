@@ -9,7 +9,7 @@ import { type RelayConfig } from '../config';
 import type { DeliveryMessage, Env } from '../env';
 import type { Receiver } from '../types';
 import { isDeliverableUrl, normalizeDomain } from '../utils/domains';
-import { countPayloads, createPayload, deletePayload, listCapabilities, listReceivers } from '../store/repo';
+import { countPendingJobs, createPayload, deletePayload, listBlockedDomains, listCapabilities, listLimitedDomains, listReceivers } from '../store/repo';
 import { profileForDelivery } from './remote';
 
 export interface FanOutResult {
@@ -18,19 +18,30 @@ export interface FanOutResult {
 	reason?: 'fanout_limit' | 'queue_full' | 'broker';
 }
 
-/** Removes a trailing dot, lowercases, and de-duplicates delivery targets. */
-export function selectTargets(receivers: Receiver[], excludeDomains: string[]): Receiver[] {
+/**
+ * Removes a trailing dot, lowercases, and de-duplicates delivery targets.
+ * Domains in `silenced` (blocked or limited by moderation) are skipped: a
+ * block/limit must stop the relay from delivering to that domain too.
+ */
+export function selectTargets(receivers: Receiver[], excludeDomains: string[], silenced: Set<string> = new Set()): Receiver[] {
 	const excluded = new Set(excludeDomains.map((domain) => normalizeDomain(domain)).filter(Boolean));
 	const seen = new Set<string>();
 	const targets: Receiver[] = [];
 	for (const receiver of receivers) {
 		const domain = normalizeDomain(receiver.domain);
 		if (!domain || excluded.has(domain) || seen.has(domain)) continue;
+		if (silenced.has(domain)) continue;
 		if (!isDeliverableUrl(receiver.inboxUrl)) continue;
 		seen.add(domain);
 		targets.push({ ...receiver, domain });
 	}
 	return targets;
+}
+
+/** Blocked + limited domains as a single lookup set for fan-out filtering. */
+export async function silencedDomains(env: Env): Promise<Set<string>> {
+	const [blocked, limited] = await Promise.all([listBlockedDomains(env.DB), listLimitedDomains(env.DB)]);
+	return new Set([...blocked, ...limited].map((domain) => normalizeDomain(domain)).filter(Boolean));
 }
 
 /**
@@ -43,7 +54,7 @@ export async function enqueueDeliveries(env: Env, config: RelayConfig, body: str
 	if (unique.length === 0) return { ok: true, queued: 0 };
 	if (unique.length > config.maxFanoutTargets) return { ok: false, queued: 0, reason: 'fanout_limit' };
 
-	const pending = await countPayloads(env.DB);
+	const pending = await countPendingJobs(env.DB);
 	if (pending + unique.length > config.maxQueueJobs) return { ok: false, queued: 0, reason: 'queue_full' };
 
 	const capabilities = await listCapabilities(env.DB, 'delivery');
@@ -55,10 +66,21 @@ export async function enqueueDeliveries(env: Env, config: RelayConfig, body: str
 		profile: profileForDelivery(config, inboxUrl, capabilities),
 	}));
 
-	await createPayload(env.DB, payloadId, body, messages.length);
+	try {
+		await createPayload(env.DB, payloadId, body, messages.length);
+	} catch (error) {
+		console.error('fan-out payload store failed', { payloadId, error: error instanceof Error ? error.message : String(error) });
+		return { ok: false, queued: 0, reason: 'broker' };
+	}
 	try {
 		for (let index = 0; index < messages.length; index += 100) {
-			await env.DELIVERY_QUEUE.sendBatch(messages.slice(index, index + 100).map((message) => ({ body: message })));
+			const chunk = messages.slice(index, index + 100).map((message) => ({ body: message }));
+			try {
+				await env.DELIVERY_QUEUE.sendBatch(chunk);
+			} catch {
+				// One bounded retry before giving up on the whole payload.
+				await env.DELIVERY_QUEUE.sendBatch(chunk);
+			}
 		}
 	} catch (error) {
 		await deletePayload(env.DB, payloadId);
@@ -70,8 +92,8 @@ export async function enqueueDeliveries(env: Env, config: RelayConfig, body: str
 
 /** Fans a body out to every registered receiver, excluding source domains. */
 export async function enqueueFanOut(env: Env, config: RelayConfig, body: string, excludeDomains: string[]): Promise<FanOutResult> {
-	const receivers = await listReceivers(env.DB);
-	const targets = selectTargets(receivers, excludeDomains);
+	const [receivers, silenced] = await Promise.all([listReceivers(env.DB), silencedDomains(env)]);
+	const targets = selectTargets(receivers, excludeDomains, silenced);
 	return enqueueDeliveries(
 		env,
 		config,
@@ -82,8 +104,12 @@ export async function enqueueFanOut(env: Env, config: RelayConfig, body: string,
 
 /** Fans a body out to the traditional subscribers only. */
 export async function enqueueToSubscribers(env: Env, config: RelayConfig, body: string, excludeDomains: string[]): Promise<FanOutResult> {
-	const receivers = (await listReceivers(env.DB)).filter((receiver) => receiver.kind === 'subscriber');
-	const targets = selectTargets(receivers, excludeDomains);
+	const [receivers, silenced] = await Promise.all([listReceivers(env.DB), silencedDomains(env)]);
+	const targets = selectTargets(
+		receivers.filter((receiver) => receiver.kind === 'subscriber'),
+		excludeDomains,
+		silenced,
+	);
 	return enqueueDeliveries(
 		env,
 		config,
@@ -94,8 +120,12 @@ export async function enqueueToSubscribers(env: Env, config: RelayConfig, body: 
 
 /** Fans a body out to follower-style receivers, excluding the given domains. */
 export async function enqueueToFollowers(env: Env, config: RelayConfig, body: string, excludeDomains: string[]): Promise<FanOutResult> {
-	const receivers = (await listReceivers(env.DB)).filter((receiver) => receiver.kind === 'follower');
-	const targets = selectTargets(receivers, excludeDomains);
+	const [receivers, silenced] = await Promise.all([listReceivers(env.DB), silencedDomains(env)]);
+	const targets = selectTargets(
+		receivers.filter((receiver) => receiver.kind === 'follower'),
+		excludeDomains,
+		silenced,
+	);
 	return enqueueDeliveries(
 		env,
 		config,

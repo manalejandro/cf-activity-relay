@@ -5,15 +5,17 @@
  * exhaustion, so one failing receiver can never delete the body needed by
  * another receiver or by its own delayed retry.
  */
-import { DELIVERY_MAX_ATTEMPTS, DELIVERY_RETRY_DELAYS, DELIVERY_TIMEOUT_MS, MAX_ERROR_BODY_BYTES, loadConfig, type RelayConfig } from '../config';
+import { DELIVERY_MAX_ATTEMPTS, DELIVERY_RETRY_DELAYS, DELIVERY_TIMEOUT_MS, MAX_ERROR_BODY_BYTES, RELAY_SOFTWARE_NAME, RELAY_SOFTWARE_VERSION, loadConfig, type RelayConfig } from '../config';
 import { signLegacyRequest } from '../crypto/legacy';
 import { signRfc9421Request } from '../crypto/rfc9421';
 import type { DeliveryMessage, Env } from '../env';
-import { decrementPayload, getPayload, recordReceiverFailure, recordReceiverSuccess } from '../store/repo';
-import { hostOf, isDeliverableUrl } from '../utils/domains';
-import { readBoundedText } from '../utils/http';
+import { decrementPayload, getPayload, recordReceiverFailure, recordReceiverSuccess, setCapability } from '../store/repo';
+import { hostOf, isDeliverableUrl, normalizeOrigin } from '../utils/domains';
+import { discardBody, readTextBounded } from '../utils/http';
 import type { RelayIdentity } from './identity';
 import { getRelayIdentity } from './identity';
+import { CAPABILITY_LEGACY_TTL_SECONDS } from '../config';
+import { shouldFallbackToLegacy } from './remote';
 
 function isPermanentStatus(status: number): boolean {
 	if (status >= 300 && status < 400) return true;
@@ -41,20 +43,36 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 		return;
 	}
 	const domain = hostOf(task.inboxUrl);
+	const origin = normalizeOrigin(task.inboxUrl);
 	let response: Response | null = null;
 	let errorText: string | null = null;
-	try {
+	let profile = task.profile;
+	const post = async (wireProfile: 'legacy' | 'rfc9421'): Promise<Response | null> => {
 		const signing =
-			task.profile === 'legacy'
+			wireProfile === 'legacy'
 				? await signLegacyRequest({ method: 'POST', url: task.inboxUrl, body: payload.body, privateKeyPem: identity.privateKeyPem, keyId: identity.keyId })
 				: await signRfc9421Request({ method: 'POST', url: task.inboxUrl, body: payload.body, privateKeyPem: identity.privateKeyPem, keyId: identity.keyId });
-		response = await fetch(task.inboxUrl, {
+		return fetch(task.inboxUrl, {
 			method: 'POST',
-			headers: { ...signing },
+			headers: { ...signing, 'User-Agent': `${RELAY_SOFTWARE_NAME}/${RELAY_SOFTWARE_VERSION} (+${config.baseUrl})` },
 			body: payload.body,
 			redirect: 'manual',
 			signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
 		});
+	};
+	try {
+		response = await post(profile);
+		// A peer that challenges our RFC 9421 delivery gets one bounded legacy
+		// retry (NodeBB rejects RFC 9421 deliveries outright); the downgrade is
+		// remembered so later fan-outs plan legacy for this origin.
+		if (response && profile === 'rfc9421' && shouldFallbackToLegacy(response)) {
+			await discardBody(response);
+			response = await post('legacy');
+			profile = 'legacy';
+			if (response?.ok && origin) {
+				await ignoreFailure(() => setCapability(env.DB, origin, 'delivery', 'legacy', CAPABILITY_LEGACY_TTL_SECONDS));
+			}
+		}
 	} catch (error) {
 		errorText = error instanceof Error ? error.message : 'network error';
 	}
@@ -62,28 +80,31 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 	if (response?.ok) {
 		await ignoreFailure(() => recordReceiverSuccess(env.DB, domain));
 		await decrementPayload(env.DB, task.payloadId);
+		await discardBody(response);
 		message.ack();
-		console.log('delivery ok', { domain, status: response.status, profile: task.profile });
+		console.log('delivery ok', { domain, status: response.status, profile });
 		return;
 	}
 
 	const status = response?.status ?? 0;
-	const responseText = response ? await readBoundedText(response, MAX_ERROR_BODY_BYTES) : '';
+	const responseText = response ? await readTextBounded(response, MAX_ERROR_BODY_BYTES) : '';
 	const permanent = response !== null && isPermanentStatus(status);
 	if (permanent || message.attempts >= DELIVERY_MAX_ATTEMPTS) {
 		await ignoreFailure(() => recordReceiverFailure(env.DB, domain));
 		await decrementPayload(env.DB, task.payloadId);
+		await discardBody(response);
 		message.ack();
 		console.warn('delivery failed', {
 			domain,
 			status,
 			attempts: message.attempts,
-			profile: task.profile,
-			error: (errorText ?? responseText).slice(0, 200),
+			profile,
+			error: (errorText ?? (responseText || '')).slice(0, 200),
 		});
 		return;
 	}
 
+	await discardBody(response);
 	const delay = DELIVERY_RETRY_DELAYS[Math.min(message.attempts, DELIVERY_RETRY_DELAYS.length) - 1];
 	console.log('delivery retry', { domain, status, attempts: message.attempts, delaySeconds: delay });
 	message.retry({ delaySeconds: delay });

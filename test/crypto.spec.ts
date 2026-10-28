@@ -68,6 +68,26 @@ describe('legacy HTTP signatures', () => {
 		expect(result.ok).toBe(false);
 	});
 
+	it('rejects a POST signature that does not cover the host', async () => {
+		// A signature over `(request-target) date digest` only would verify on
+		// any relay sharing the /inbox path: cross-relay replay. The host (or
+		// an authority component) must be covered for POST.
+		const body = JSON.stringify({ type: 'Create', actor: 'https://remote.example/actor' });
+		const date = new Date().toUTCString();
+		const digest = `SHA-256=${await sha256Base64(body)}`;
+		const signingString = ['(request-target): post /inbox', `date: ${date}`, `digest: ${digest}`].join('\n');
+		const key = await importPrivateKey(privateKeyPem);
+		const signature = new Uint8Array(await crypto.subtle.sign(RSA_ALGORITHM, key, new TextEncoder().encode(signingString)));
+		const headers = {
+			date,
+			digest,
+			signature: `keyId="${KEY_ID}",algorithm="rsa-sha256",headers="(request-target) date digest",signature="${btoa(String.fromCharCode(...signature))}"`,
+		};
+		const result = await verifyLegacySignature({ method: 'POST', url: URL, headers, body, publicKeyPem });
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain('host');
+	});
+
 	it('parses signature header parameters', () => {
 		const parsed = parseSignatureHeader('keyId="https://a.example/actor#main-key",algorithm="rsa-sha256",headers="(request-target) host date",signature="abc"');
 		expect(parsed?.keyId).toBe('https://a.example/actor#main-key');

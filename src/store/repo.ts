@@ -42,6 +42,26 @@ export function ensureSchema(db: D1Database): Promise<void> {
 	return schemaPromise;
 }
 
+let startupPromise: Promise<void> | null = null;
+
+/**
+ * Schema plus one-time seeding of the operator supplied domain lists
+ * (`BLOCKED_DOMAINS`, `LIMITED_DOMAINS`). Runs once per isolate.
+ */
+export function ensureStartup(db: D1Database, blocked: string[], limited: string[]): Promise<void> {
+	if (!startupPromise) {
+		startupPromise = ensureSchema(db)
+			.then(async () => {
+				if (blocked.length > 0 || limited.length > 0) await seedDomainPolicies(db, blocked, limited);
+			})
+			.catch((error) => {
+				startupPromise = null;
+				throw error;
+			});
+	}
+	return startupPromise;
+}
+
 function nowIso(): string {
 	return new Date().toISOString();
 }
@@ -90,6 +110,23 @@ export async function storeIdentity(db: D1Database, identity: StoredIdentity): P
 			.bind(identity.privateKeyPem, timestamp),
 		db
 			.prepare("INSERT INTO relay_config (key, value, updated_at) VALUES ('public_key_pem', ?, ?) ON CONFLICT(key) DO NOTHING")
+			.bind(identity.publicKeyPem, timestamp),
+	]);
+}
+
+/**
+ * Replaces the stored identity. Used when an externally managed
+ * `RELAY_PRIVATE_KEY_PEM` secret is supplied or rotated: the secret always
+ * wins over previously generated material.
+ */
+export async function setIdentity(db: D1Database, identity: StoredIdentity): Promise<void> {
+	const timestamp = nowIso();
+	await db.batch([
+		db
+			.prepare("INSERT INTO relay_config (key, value, updated_at) VALUES ('private_key_pem', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+			.bind(identity.privateKeyPem, timestamp),
+		db
+			.prepare("INSERT INTO relay_config (key, value, updated_at) VALUES ('public_key_pem', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
 			.bind(identity.publicKeyPem, timestamp),
 	]);
 }
@@ -300,12 +337,34 @@ export async function isLimited(db: D1Database, domain: string): Promise<boolean
 	return row?.present === 1;
 }
 
+/** Both policy flags for a domain in a single round trip (hot path). */
+export async function getDomainPolicyFlags(db: D1Database, domain: string): Promise<{ blocked: boolean; limited: boolean }> {
+	const row = await db
+		.prepare(
+			`SELECT
+			   (SELECT 1 FROM blocked_domains WHERE domain = ?) AS blocked,
+			   (SELECT 1 FROM limited_domains WHERE domain = ?) AS limited`,
+		)
+		.bind(domain, domain)
+		.first<{ blocked: number | null; limited: number | null }>();
+	return { blocked: row?.blocked === 1, limited: row?.limited === 1 };
+}
+
 export async function setDomainPolicy(db: D1Database, table: 'blocked_domains' | 'limited_domains', domain: string, enabled: boolean): Promise<void> {
 	if (enabled) {
 		await db.prepare(`INSERT INTO ${table} (domain, created_at) VALUES (?, ?) ON CONFLICT(domain) DO NOTHING`).bind(domain, nowIso()).run();
 	} else {
 		await db.prepare(`DELETE FROM ${table} WHERE domain = ?`).bind(domain).run();
 	}
+}
+
+/** Seeds the operator supplied domain lists at startup; never removes rows. */
+export async function seedDomainPolicies(db: D1Database, blocked: string[], limited: string[]): Promise<void> {
+	const statements: D1PreparedStatement[] = [];
+	const timestamp = nowIso();
+	for (const domain of blocked) statements.push(db.prepare('INSERT INTO blocked_domains (domain, created_at) VALUES (?, ?) ON CONFLICT(domain) DO NOTHING').bind(domain, timestamp));
+	for (const domain of limited) statements.push(db.prepare('INSERT INTO limited_domains (domain, created_at) VALUES (?, ?) ON CONFLICT(domain) DO NOTHING').bind(domain, timestamp));
+	if (statements.length > 0) await db.batch(statements);
 }
 
 // ---------------------------------------------------------------------------
@@ -390,29 +449,32 @@ export async function recordReceiverFailure(db: D1Database, domain: string): Pro
 }
 
 export async function listReceiverHealth(db: D1Database, domains: string[]): Promise<Map<string, ReceiverHealth>> {
-	if (domains.length === 0) return new Map();
-	const placeholders = domains.map(() => '?').join(', ');
-	const rows = await db
-		.prepare(`SELECT * FROM receiver_health WHERE domain IN (${placeholders})`)
-		.bind(...domains)
-		.all<{
-			domain: string;
-			last_success_at: string | null;
-			last_failure_at: string | null;
-			consecutive_failures: number;
-			total_successes: number;
-			total_failures: number;
-		}>();
 	const map = new Map<string, ReceiverHealth>();
-	for (const row of rows.results ?? []) {
-		map.set(row.domain, {
-			domain: row.domain,
-			lastSuccessAt: row.last_success_at,
-			lastFailureAt: row.last_failure_at,
-			consecutiveFailures: row.consecutive_failures,
-			totalSuccesses: row.total_successes,
-			totalFailures: row.total_failures,
-		});
+	// D1 allows at most 100 bound parameters per query: page the domains.
+	for (let start = 0; start < domains.length; start += 100) {
+		const chunk = domains.slice(start, start + 100);
+		const placeholders = chunk.map(() => '?').join(', ');
+		const rows = await db
+			.prepare(`SELECT * FROM receiver_health WHERE domain IN (${placeholders})`)
+			.bind(...chunk)
+			.all<{
+				domain: string;
+				last_success_at: string | null;
+				last_failure_at: string | null;
+				consecutive_failures: number;
+				total_successes: number;
+				total_failures: number;
+			}>();
+		for (const row of rows.results ?? []) {
+			map.set(row.domain, {
+				domain: row.domain,
+				lastSuccessAt: row.last_success_at,
+				lastFailureAt: row.last_failure_at,
+				consecutiveFailures: row.consecutive_failures,
+				totalSuccesses: row.total_successes,
+				totalFailures: row.total_failures,
+			});
+		}
 	}
 	return map;
 }
@@ -444,8 +506,9 @@ export async function deletePayload(db: D1Database, id: string): Promise<void> {
 	await db.prepare('DELETE FROM activity_payloads WHERE id = ?').bind(id).run();
 }
 
-export async function countPayloads(db: D1Database): Promise<number> {
-	const row = await db.prepare('SELECT COUNT(*) AS total FROM activity_payloads').first<{ total: number }>();
+/** Number of delivery jobs still outstanding across all shared payloads. */
+export async function countPendingJobs(db: D1Database): Promise<number> {
+	const row = await db.prepare('SELECT COALESCE(SUM(remain_count), 0) AS total FROM activity_payloads').first<{ total: number }>();
 	return row?.total ?? 0;
 }
 

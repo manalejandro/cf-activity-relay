@@ -1,4 +1,4 @@
-import { ACTIVITY_STREAMS_CONTEXT, type RelayConfig } from '../config';
+import { ACTIVITY_STREAMS_CONTEXT, RELAY_REPOSITORY, RELAY_SOFTWARE_NAME, RELAY_SOFTWARE_VERSION, type RelayConfig } from '../config';
 import type { Env } from '../env';
 import { getRelayIdentity } from './identity';
 
@@ -70,9 +70,9 @@ export function nodeInfoDocument(config: RelayConfig, subscriberCount: number): 
 	return {
 		version: '2.1',
 		software: {
-			name: 'cf-activity-relay',
-			version: '1.0.0',
-			repository: 'https://github.com/manalejandro/cf-activity-relay',
+			name: RELAY_SOFTWARE_NAME,
+			version: RELAY_SOFTWARE_VERSION,
+			repository: RELAY_REPOSITORY,
 		},
 		protocols: ['activitypub'],
 		services: { inbound: [], outbound: [] },

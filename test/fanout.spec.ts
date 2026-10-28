@@ -33,6 +33,15 @@ describe('fan-out target selection', () => {
 		expect(targets.map((target) => target.domain)).toEqual(['good.example']);
 	});
 
+	it('skips silenced (blocked or limited) domains', () => {
+		const targets = selectTargets(
+			[receiver('blocked.example', 'https://blocked.example/inbox'), receiver('limited.example', 'https://limited.example/inbox', 'follower'), receiver('ok.example', 'https://ok.example/inbox')],
+			[],
+			new Set(['blocked.example', 'limited.example']),
+		);
+		expect(targets.map((target) => target.domain)).toEqual(['ok.example']);
+	});
+
 	it('normalizes domain casing and trailing dots before de-duplicating', () => {
 		const targets = selectTargets([receiver('A.Example.', 'https://a.example/inbox'), receiver('a.example', 'https://a.example/other-inbox')], []);
 		expect(targets).toHaveLength(1);

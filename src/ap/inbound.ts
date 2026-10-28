@@ -6,7 +6,7 @@
  * actor/key host binding, public-address policy evaluation, and finally the
  * fan-out state machine.
  */
-import { PUBLIC_ADDRESS, type RelayConfig } from '../config';
+import { CAPABILITY_RFC9421_TTL_SECONDS, PUBLIC_ADDRESS, type RelayConfig } from '../config';
 import type { Env } from '../env';
 import { digestHeaderMatches, parseSignatureHeader, verifyLegacySignature } from '../crypto/legacy';
 import { parseSignatureInput, verifyRfc9421Signature } from '../crypto/rfc9421';
@@ -17,9 +17,8 @@ import {
 	deleteFollower,
 	deletePending,
 	deleteSubscriber,
+	getDomainPolicyFlags,
 	getFollower,
-	isBlocked,
-	isLimited,
 	isSubscriberOrFollower,
 	listFollowers,
 	listSubscribers,
@@ -31,11 +30,12 @@ import {
 	reserveActivity,
 	reserveCanonical,
 	reserveNonce,
+	setCapability,
 	updateFollowerMutual,
 } from '../store/repo';
-import { asStringArray, hostOf, isEmbeddedObject, objectId } from '../utils/domains';
+import { asStringArray, hostOf, isDeliverableUrl, isEmbeddedObject, normalizeOrigin, objectId } from '../utils/domains';
 import type { APActivity, RelaySettings, RemoteActor } from '../types';
-import { relayAnnounce, relayFollow, relayReply } from './builders';
+import { relayAnnounce, relayFollow, relayReply, relayUndoFollow } from './builders';
 import { enqueueDeliveries, enqueueFanOut, enqueueToFollowers, enqueueToSubscribers } from './fanout';
 import type { RelayIdentity } from './identity';
 import { allowsPublicAddress, excludesPublicOnlyInCc } from './policy';
@@ -232,6 +232,18 @@ async function verifyRfc9421(
 			}
 		}
 
+		// A peer that signs inbound requests with RFC 9421 can very likely
+		// verify it too: remember the evidence so dual-mode fan-out plans
+		// RFC 9421 deliveries for that origin (with a bounded legacy fallback).
+		const origin = normalizeOrigin(signerActor.id);
+		if (origin) {
+			try {
+				await setCapability(env.DB, origin, 'delivery', 'rfc9421', CAPABILITY_RFC9421_TTL_SECONDS);
+			} catch (error) {
+				console.warn('unable to record delivery capability', { origin, error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+
 		const settings = await loadSettings(env, config);
 		return { ok: true, ctx: { env, config, identity, settings, activity, actor: signerActor, body } };
 	}
@@ -247,7 +259,13 @@ async function loadSettings(env: Env, config: RelayConfig): Promise<RelaySetting
 // Policy helpers
 // ---------------------------------------------------------------------------
 
-function isActorAbleToBeFollower(actor: RemoteActor): boolean {
+/**
+ * True when the actor is a server-level actor entitled to subscribe:
+ * `Application`/`Service` actors or the historical `/relay` and `/friendica`
+ * server-actor paths. A personal account following the relay would otherwise
+ * receive every relayed public activity in its home timeline.
+ */
+function isServerActor(actor: RemoteActor): boolean {
 	if (actor.type === 'Application' || actor.type === 'Service') return true;
 	try {
 		const path = new URL(actor.id).pathname.replace(/\/$/, '');
@@ -260,8 +278,8 @@ function isActorAbleToBeFollower(actor: RemoteActor): boolean {
 async function isActorAbleToRelay(ctx: InboundContext, actor: RemoteActor): Promise<boolean> {
 	const domain = hostOf(actor.id);
 	if (!domain) return false;
-	if (await isBlocked(ctx.env.DB, domain)) return false;
-	if (await isLimited(ctx.env.DB, domain)) return false;
+	const flags = await getDomainPolicyFlags(ctx.env.DB, domain);
+	if (flags.blocked || flags.limited) return false;
 	if (ctx.settings.personOnly && actor.type !== 'Person') return false;
 	return true;
 }
@@ -324,7 +342,8 @@ async function sendReply(ctx: InboundContext, type: 'Accept' | 'Reject', inboxUr
 async function recordPublisherActivity(ctx: InboundContext): Promise<{ ok: boolean; error?: string }> {
 	const domain = hostOf(ctx.actor.id);
 	if (!domain) return { ok: false, error: 'activity actor has an invalid ID' };
-	if (await isBlocked(ctx.env.DB, domain)) return { ok: false, error: `${domain} is blocked` };
+	const flags = await getDomainPolicyFlags(ctx.env.DB, domain);
+	if (flags.blocked) return { ok: false, error: `${domain} is blocked` };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { ok: true };
 	await recordPublisher(ctx.env.DB, {
 		domain,
@@ -338,14 +357,20 @@ async function recordPublisherActivity(ctx: InboundContext): Promise<{ ok: boole
 
 async function executeRelayActivity(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
+	const flags = await getDomainPolicyFlags(ctx.env.DB, sourceDomain);
+	if (flags.blocked) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { status: 202 };
 
 	const publisher = await recordPublisherActivity(ctx);
 	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 
-	// Duplicate deliveries of the same activity must not fan out twice.
-	if (ctx.activity.id && !(await reserveActivity(ctx.env.DB, ctx.activity.id))) return { status: 202 };
+	// Duplicate deliveries of the same activity must not fan out twice. The
+	// de-duplication key binds the activity id to its signer so a hostile
+	// publisher cannot reserve somebody else's identifiers.
+	if (ctx.activity.id) {
+		const dedupeKey = await sha256Hex(`${ctx.actor.id}\u0000${ctx.activity.id}`);
+		if (!(await reserveActivity(ctx.env.DB, dedupeKey))) return { status: 202 };
+	}
 
 	const preserveOriginal = hasLinkedDataSignature(ctx.body);
 	if (preserveOriginal) {
@@ -370,7 +395,8 @@ async function executeRelayActivity(ctx: InboundContext): Promise<InboundRespons
 
 async function executeEmbeddedAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
+	const flags = await getDomainPolicyFlags(ctx.env.DB, sourceDomain);
+	if (flags.blocked) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { status: 202 };
 	const embeddedId = objectId(ctx.activity.object);
 	if (!embeddedId) return { status: 202 };
@@ -383,7 +409,8 @@ async function executeEmbeddedAnnounce(ctx: InboundContext): Promise<InboundResp
 async function executePublicAnnounce(ctx: InboundContext): Promise<InboundResponse> {
 	if (shouldFanOutPublicAnnounce(ctx.activity)) return executeEmbeddedAnnounce(ctx);
 	const sourceDomain = hostOf(ctx.actor.id);
-	if (await isBlocked(ctx.env.DB, sourceDomain)) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
+	const flags = await getDomainPolicyFlags(ctx.env.DB, sourceDomain);
+	if (flags.blocked) return { status: 401, text: `${sourceDomain} is blocked`, reason: 'blocked' };
 	const publisher = await recordPublisherActivity(ctx);
 	if (!publisher.ok) return { status: 401, text: publisher.error, reason: 'blocked' };
 	return { status: 202 };
@@ -400,12 +427,21 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 	if (!referenced || typeof referenced.id !== 'string' || typeof referenced.actor !== 'string') {
 		return { status: 400, text: 'unable to fetch the announced activity' };
 	}
+	// Never amplify content the origin did not address to the public
+	// audience: relaying an unlisted or restricted object would punch through
+	// the public-address distribution policy and the origin's intent.
+	const referencedTo = asStringArray(referenced.to);
+	const referencedCc = asStringArray(referenced.cc);
+	if (!allowsPublicAddress(referencedTo, referencedCc, ctx.config.publicAddressPolicy)) {
+		return { status: 202, reason: 'referenced-not-public' };
+	}
 	const canonicalHash = await sha256Hex(referenced.id);
 	if (!(await reserveCanonical(ctx.env.DB, canonicalHash))) return { status: 202 };
 
 	const originDomain = hostOf(referenced.actor);
 	if (!originDomain) return { status: 202 };
-	if (await isBlocked(ctx.env.DB, originDomain)) return { status: 401, text: `${originDomain} is blocked`, reason: 'blocked' };
+	const originFlags = await getDomainPolicyFlags(ctx.env.DB, originDomain);
+	if (originFlags.blocked) return { status: 401, text: `${originDomain} is blocked`, reason: 'blocked' };
 	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, referenced.actor);
 	if (!originActor || !(await isActorAbleToRelay(ctx, originActor))) return { status: 202 };
 	await recordPublisher(ctx.env.DB, {
@@ -426,7 +462,8 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 	const actorDomain = hostOf(ctx.actor.id);
 	const inbox = ctx.actor.inbox ?? ctx.actor.sharedInbox;
-	if (await isBlocked(ctx.env.DB, actorDomain)) {
+	const flags = await getDomainPolicyFlags(ctx.env.DB, actorDomain);
+	if (flags.blocked) {
 		await sendReply(ctx, 'Reject', inbox);
 		return { status: 202, reason: 'blocked' };
 	}
@@ -438,10 +475,22 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 	}
 	const objectValues = asStringArray(ctx.activity.object);
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
+		// Traditional subscriptions also come from server actors: a personal
+		// account sending Follow(Public) would pull the whole firehose into a
+		// home timeline.
+		if (!isServerActor(ctx.actor)) {
+			await sendReply(ctx, 'Reject', inbox);
+			return { status: 202, reason: 'not-a-server-actor' };
+		}
+		const subscriberInbox = ctx.actor.sharedInbox ?? ctx.actor.inbox;
+		if (!subscriberInbox || !isDeliverableUrl(subscriberInbox)) {
+			await sendReply(ctx, 'Reject', inbox);
+			return { status: 202, reason: 'no-usable-inbox' };
+		}
 		if (ctx.settings.manuallyAccept) {
 			await putPending(ctx.env.DB, {
 				domain: actorDomain,
-				inboxUrl: ctx.actor.sharedInbox ?? ctx.actor.inbox ?? '',
+				inboxUrl: subscriberInbox,
 				activityId: ctx.activity.id ?? '',
 				type: 'Follow',
 				actor: ctx.actor.id,
@@ -453,24 +502,29 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 		await sendReply(ctx, 'Accept', inbox);
 		await addSubscriber(ctx.env.DB, {
 			domain: actorDomain,
-			inboxUrl: ctx.actor.sharedInbox ?? ctx.actor.inbox ?? '',
+			inboxUrl: subscriberInbox,
 			activityId: ctx.activity.id ?? '',
 			actorId: ctx.actor.id,
 		});
 		return { status: 202, reason: 'subscribed' };
 	}
 	if (objectValues.includes(ctx.config.actorId)) {
-		if (!isActorAbleToBeFollower(ctx.actor)) {
+		if (!isServerActor(ctx.actor)) {
 			// Only server actors subscribe by following the relay actor. A
 			// personal account following it would otherwise receive every
 			// relayed public activity in its home timeline.
 			await sendReply(ctx, 'Reject', inbox);
 			return { status: 202, reason: 'not-a-server-actor' };
 		}
+		const followerInbox = ctx.actor.inbox ?? ctx.actor.sharedInbox;
+		if (!followerInbox || !isDeliverableUrl(followerInbox)) {
+			await sendReply(ctx, 'Reject', inbox);
+			return { status: 202, reason: 'no-usable-inbox' };
+		}
 		if (ctx.settings.manuallyAccept) {
 			await putPending(ctx.env.DB, {
 				domain: actorDomain,
-				inboxUrl: ctx.actor.inbox ?? ctx.actor.sharedInbox ?? '',
+				inboxUrl: followerInbox,
 				activityId: ctx.activity.id ?? '',
 				type: 'Follow',
 				actor: ctx.actor.id,
@@ -481,12 +535,12 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 		}
 		await addFollower(ctx.env.DB, {
 			domain: actorDomain,
-			inboxUrl: ctx.actor.inbox ?? ctx.actor.sharedInbox ?? '',
+			inboxUrl: followerInbox,
 			activityId: ctx.activity.id ?? '',
 			actorId: ctx.actor.id,
 		});
 		await sendReply(ctx, 'Accept', inbox);
-		if (!(await isLimited(ctx.env.DB, actorDomain))) {
+		if (!flags.limited) {
 			await sendActivity(ctx, ctx.actor.inbox, JSON.stringify(relayFollow(ctx.config, ctx.actor.id)));
 		}
 		return { status: 202, reason: 'followed' };
@@ -497,15 +551,24 @@ async function executeFollowing(ctx: InboundContext): Promise<InboundResponse> {
 
 async function executeUnfollowing(ctx: InboundContext, innerFollow: Record<string, unknown>): Promise<InboundResponse> {
 	const actorDomain = hostOf(ctx.actor.id);
+	// The inner Follow must belong to the verified signer; stale or forged
+	// Undo payloads must never mutate subscription state.
+	if (typeof innerFollow.actor === 'string' && innerFollow.actor !== ctx.actor.id) {
+		await sendReply(ctx, 'Reject', ctx.actor.inbox ?? ctx.actor.sharedInbox);
+		return { status: 202, reason: 'undo-actor-mismatch' };
+	}
 	const objectValues = asStringArray(innerFollow.object);
 	if (objectValues.includes(PUBLIC_ADDRESS)) {
 		await deleteSubscriber(ctx.env.DB, actorDomain);
 		await deletePending(ctx.env.DB, actorDomain);
 		return { status: 202, reason: 'unsubscribed' };
 	}
-	if (objectValues.includes(ctx.config.actorId) && isActorAbleToBeFollower(ctx.actor)) {
+	if (objectValues.includes(ctx.config.actorId) && isServerActor(ctx.actor)) {
+		const follower = await getFollower(ctx.env.DB, actorDomain);
 		await deleteFollower(ctx.env.DB, actorDomain);
 		await deletePending(ctx.env.DB, actorDomain);
+		// Tell the peer so it can drop the relay from its own following list.
+		if (follower) await sendActivity(ctx, follower.inboxUrl, JSON.stringify(relayUndoFollow(ctx.config, follower.actorId)));
 		return { status: 202, reason: 'unfollowed' };
 	}
 	await sendReply(ctx, 'Reject', ctx.actor.inbox ?? ctx.actor.sharedInbox);
@@ -535,12 +598,16 @@ async function finalizeMutuallyFollow(ctx: InboundContext): Promise<InboundRespo
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/** True when the audience addresses the relay or one of its followers. */
+async function addressesRelay(db: D1Database, config: RelayConfig, to: string[], cc: string[]): Promise<boolean> {
+	if (to.includes(config.actorId) || cc.includes(config.actorId)) return true;
+	return (await isToMyFollower(db, to)) || (await isToMyFollower(db, cc));
+}
+
 async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	const to = asStringArray(ctx.activity.to);
 	const cc = asStringArray(ctx.activity.cc);
 	const policy = ctx.config.publicAddressPolicy;
-	const addressesRelay =
-		to.includes(ctx.config.actorId) || cc.includes(ctx.config.actorId) || (await isToMyFollower(ctx.env.DB, to)) || (await isToMyFollower(ctx.env.DB, cc));
 
 	if (allowsPublicAddress(to, cc, policy)) {
 		switch (ctx.activity.type) {
@@ -556,7 +623,9 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 		}
 	}
 
-	if (addressesRelay) {
+	// Evaluated lazily: the public path (the overwhelming majority of relay
+	// traffic) never needs the follower-collection lookups.
+	if (await addressesRelay(ctx.env.DB, ctx.config, to, cc)) {
 		switch (ctx.activity.type) {
 			case 'Follow':
 				return executeFollowing(ctx);

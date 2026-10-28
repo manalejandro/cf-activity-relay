@@ -36,6 +36,22 @@ describe('domain helpers', () => {
 		expect(isPrivateHost('172.32.0.1')).toBe(false);
 	});
 
+	it('blocks CGNAT, abbreviated, mapped and hexadecimal IP literals', () => {
+		expect(isPrivateHost('100.64.1.1')).toBe(true);
+		expect(isPrivateHost('127.1')).toBe(true);
+		expect(isPrivateHost('2130706433')).toBe(true); // inet_aton for 127.0.0.1
+		expect(isPrivateHost('0x7f000001')).toBe(true);
+		expect(isPrivateHost('0177.0.0.1')).toBe(true);
+		expect(isPrivateHost('::ffff:127.0.0.1')).toBe(true);
+		expect(isPrivateHost('::1')).toBe(true);
+		expect(isPrivateHost('fc00::1')).toBe(true);
+		expect(isPrivateHost('fe80::1')).toBe(true);
+		expect(isPrivateHost('203.0.113.5')).toBe(true);
+		expect(isPrivateHost('198.18.0.1')).toBe(true);
+		expect(isPrivateHost('8.8.8.8')).toBe(false);
+		expect(isPrivateHost('2001:4860:4860::8888')).toBe(false);
+	});
+
 	it('validates deliverable URLs', () => {
 		expect(isDeliverableUrl('https://example.org/inbox')).toBe(true);
 		expect(isDeliverableUrl('https://localhost/inbox')).toBe(false);

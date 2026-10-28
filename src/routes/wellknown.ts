@@ -1,13 +1,13 @@
 import type { RelayConfig } from '../config';
 import type { Env } from '../env';
-import { jsonResponse, methodNotAllowed } from '../utils/http';
+import { jsonResponse, jrdResponse, methodNotAllowed } from '../utils/http';
 import { nodeInfoDiscovery, nodeInfoDocument, webfingerDocument } from '../ap/actor';
 import { listSubscribers } from '../store/repo';
 
-/** `GET /.well-known/nodeinfo` */
+/** `GET /.well-known/nodeinfo` — JRD discovery document (RFC 7033 shape). */
 export function handleNodeInfoDiscovery(config: RelayConfig, request: Request): Response {
 	if (request.method !== 'GET') return new Response(null, { status: 400 });
-	return jsonResponse(nodeInfoDiscovery(config));
+	return jrdResponse(nodeInfoDiscovery(config));
 }
 
 /** `GET /.well-known/webfinger?resource=acct:relay@host` */
@@ -17,14 +17,14 @@ export function handleWebFinger(config: RelayConfig, request: Request, url: URL)
 	if (!resource) return new Response(null, { status: 400 });
 	const accepted = resource === `acct:relay@${config.domain}` || resource === config.actorId;
 	if (!accepted) return new Response(null, { status: 404 });
-	return jsonResponse(webfingerDocument(config));
+	return jrdResponse(webfingerDocument(config));
 }
 
 /** `GET /nodeinfo/2.1` */
 export async function handleNodeInfo(env: Env, config: RelayConfig, request: Request): Promise<Response> {
 	if (request.method !== 'GET') return new Response(null, { status: 400 });
 	const subscribers = await listSubscribers(env.DB);
-	return jsonResponse(nodeInfoDocument(config, subscribers.length));
+	return jsonResponse(nodeInfoDocument(config, subscribers.length), {}, 'application/json; profile="http://nodeinfo.diaspora.software/ns/schema/2.1#"');
 }
 
 export { methodNotAllowed };

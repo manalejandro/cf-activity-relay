@@ -31,6 +31,10 @@ export async function handleStatus(env: Env, config: RelayConfig, request: Reque
 	const health = await listReceiverHealth(env.DB, receivingDomains);
 	const subscriberSet = new Set(subscriberDomains);
 	const receivingSet = new Set(receivingDomains);
+	// The publisher list grows without bound: expose the most active ones and
+	// keep the exact total in `count`.
+	const STATUS_MAX_PUBLISHER_ENTRIES = 100;
+	const publisherEntries = [...publishers].sort((a, b) => b.activityCount - a.activityCount).slice(0, STATUS_MAX_PUBLISHER_ENTRIES);
 
 	const body: Record<string, unknown> = {
 		schema_version: 5,
@@ -68,7 +72,7 @@ export async function handleStatus(env: Env, config: RelayConfig, request: Reque
 		},
 		publishers: {
 			count: publisherDomains.length,
-			entries: publishers.map((publisher) => ({
+			entries: publisherEntries.map((publisher) => ({
 				domain: publisher.domain,
 				first_seen: publisher.firstSeen,
 				last_seen: publisher.lastSeen,
@@ -77,6 +81,7 @@ export async function handleStatus(env: Env, config: RelayConfig, request: Reque
 				subscribed: subscriberSet.has(publisher.domain),
 				receives_relay: receivingSet.has(publisher.domain),
 			})),
+			entries_truncated: publishers.length > STATUS_MAX_PUBLISHER_ENTRIES,
 		},
 		software: {
 			name: RELAY_SOFTWARE_NAME,

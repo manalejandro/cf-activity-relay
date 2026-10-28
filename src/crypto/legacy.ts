@@ -93,6 +93,7 @@ export async function verifyLegacySignature(input: LegacyVerificationInput): Pro
 	if (!headerList.includes('date') && !headerList.includes('(created)')) return { ok: false, error: 'signature does not cover date or (created)' };
 	if (!headerList.includes('(request-target)') && !headerList.includes('digest')) return { ok: false, error: 'signature covers neither the request target nor the digest' };
 	if (method === 'POST' && !headerList.includes('digest')) return { ok: false, error: 'POST signature does not cover the digest' };
+	if (method === 'POST' && !headerList.includes('host')) return { ok: false, error: 'POST signature does not cover the host' };
 	if (method === 'GET' && !headerList.includes('host')) return { ok: false, error: 'GET signature does not cover the host' };
 	if (headerList.includes('(created)') && !parsed.created) return { ok: false, error: 'signature covers (created) but it is absent' };
 	if (headerList.includes('(expires)') && !parsed.expires) return { ok: false, error: 'signature covers (expires) but it is absent' };

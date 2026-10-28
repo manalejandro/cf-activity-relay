@@ -7,14 +7,16 @@
 import { PUBLIC_ADDRESS, type RelayConfig } from '../config';
 import type { Env } from '../env';
 import { buildRelayActor } from '../ap/actor';
-import { relayFollow, relayReply, relayUpdate } from '../ap/builders';
+import { relayFollow, relayReply, relayUndoFollow, relayUpdate } from '../ap/builders';
 import { enqueueDeliveries, enqueueFanOut } from '../ap/fanout';
+import { timingSafeEqual } from '../crypto/digest';
 import {
 	addFollower,
 	addSubscriber,
 	deleteFollower,
 	deletePending,
 	deleteSubscriber,
+	getFollower,
 	getPending,
 	isLimited,
 	listBlockedDomains,
@@ -30,15 +32,28 @@ import {
 } from '../store/repo';
 import type { APActivity } from '../types';
 import { hostOf } from '../utils/domains';
-import { jsonResponse, notFound, textResponse } from '../utils/http';
+import { jsonResponse, notFound, readBodyBounded, textResponse } from '../utils/http';
+
+const ADMIN_BODY_LIMIT_BYTES = 64 * 1024;
+const ADMIN_MAX_FAILED_ATTEMPTS = 20;
+const ADMIN_LOCKOUT_SECONDS = 300;
 
 function unauthorized(): Response {
 	return textResponse('unauthorized', 401, { headers: { 'WWW-Authenticate': 'Bearer' } });
 }
 
-async function readJsonBody(request: Request): Promise<Record<string, unknown> | null> {
+function safeDecode(value: string): string | null {
 	try {
-		const text = await request.text();
+		return decodeURIComponent(value);
+	} catch {
+		return null;
+	}
+}
+
+async function readJsonBody(request: Request): Promise<Record<string, unknown> | null> {
+	const text = await readBodyBounded(request, ADMIN_BODY_LIMIT_BYTES);
+	if (text === null) return null;
+	try {
 		if (!text) return {};
 		const parsed: unknown = JSON.parse(text);
 		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
@@ -50,7 +65,19 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown> |
 
 export async function handleAdmin(env: Env, config: RelayConfig, request: Request, url: URL): Promise<Response> {
 	if (!config.adminToken) return notFound();
-	if (request.headers.get('authorization') !== `Bearer ${config.adminToken}`) return unauthorized();
+	const ip = request.headers.get('cf-connecting-ip') ?? 'unknown';
+	const failKey = `admin-fail:${ip}`;
+	const failures = Number.parseInt((await env.CACHE.get(failKey)) ?? '0', 10) || 0;
+	if (failures >= ADMIN_MAX_FAILED_ATTEMPTS) {
+		return textResponse('too many failed attempts', 429, { headers: { 'Retry-After': String(ADMIN_LOCKOUT_SECONDS) } });
+	}
+	const authorization = request.headers.get('authorization') ?? '';
+	const presented = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+	if (!timingSafeEqual(presented, config.adminToken)) {
+		await env.CACHE.put(failKey, String(failures + 1), { expirationTtl: ADMIN_LOCKOUT_SECONDS }).catch(() => undefined);
+		return unauthorized();
+	}
+	await env.CACHE.delete(failKey).catch(() => undefined);
 
 	const segments = url.pathname.split('/').filter(Boolean);
 	// segments[0] === 'admin'
@@ -92,11 +119,16 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 
 	if (section === 'unsubscribe' && request.method === 'POST') {
 		const body = await readJsonBody(request);
+		if (body === null) return textResponse('invalid or oversized JSON body', 400);
 		const domain = typeof body?.domain === 'string' ? body.domain.trim().toLowerCase().replace(/\.$/, '') : '';
 		if (!domain) return textResponse('domain is required', 400);
+		const follower = await getFollower(env.DB, domain);
 		await deleteSubscriber(env.DB, domain);
 		await deleteFollower(env.DB, domain);
 		await deletePending(env.DB, domain);
+		if (follower) {
+			await enqueueDeliveries(env, config, JSON.stringify(relayUndoFollow(config, follower.actorId)), [follower.inboxUrl]);
+		}
 		return jsonResponse({ status: 'unsubscribed', domain });
 	}
 
@@ -131,7 +163,9 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 	}
 
 	if (section === 'pending' && segments.length === 4 && request.method === 'POST') {
-		const domain = decodeURIComponent(segments[2]);
+		const decoded = safeDecode(segments[2]);
+		if (decoded === null) return textResponse('invalid domain encoding', 400);
+		const domain = decoded;
 		const action = segments[3];
 		if (action !== 'accept' && action !== 'reject') return notFound();
 		const pending = await getPending(env.DB, domain);
@@ -156,13 +190,25 @@ export async function handleAdmin(env: Env, config: RelayConfig, request: Reques
 	}
 
 	if (section === 'domains' && segments.length === 4 && request.method === 'POST') {
-		const domain = decodeURIComponent(segments[2]).toLowerCase().replace(/\.$/, '');
+		const decoded = safeDecode(segments[2]);
+		if (decoded === null) return textResponse('invalid domain encoding', 400);
+		const domain = decoded.toLowerCase().replace(/\.$/, '');
 		const action = segments[3];
 		if (!domain) return textResponse('invalid domain', 400);
 		switch (action) {
-			case 'block':
+			case 'block': {
+				// Blocking is a hard rejection: also drop the domain as a
+				// receiver and tell follower-style peers to drop the relay.
+				const follower = await getFollower(env.DB, domain);
 				await setDomainPolicy(env.DB, 'blocked_domains', domain, true);
-				return jsonResponse({ status: 'blocked', domain });
+				await deleteSubscriber(env.DB, domain);
+				await deleteFollower(env.DB, domain);
+				await deletePending(env.DB, domain);
+				if (follower) {
+					await enqueueDeliveries(env, config, JSON.stringify(relayUndoFollow(config, follower.actorId)), [follower.inboxUrl]);
+				}
+				return jsonResponse({ status: 'blocked', domain, receivers_removed: true });
+			}
 			case 'unblock':
 				await setDomainPolicy(env.DB, 'blocked_domains', domain, false);
 				return jsonResponse({ status: 'unblocked', domain });

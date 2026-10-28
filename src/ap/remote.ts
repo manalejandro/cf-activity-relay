@@ -12,6 +12,8 @@ import {
 	CAPABILITY_RFC9421_TTL_SECONDS,
 	FETCH_TIMEOUT_MS,
 	MAX_REMOTE_DOCUMENT_BYTES,
+	RELAY_SOFTWARE_NAME,
+	RELAY_SOFTWARE_VERSION,
 	type RelayConfig,
 	type SignatureProfile,
 } from '../config';
@@ -41,7 +43,11 @@ export interface SignedFetchResult {
 	profile: SignatureProfile;
 }
 
-function shouldFallbackToLegacy(response: Response): boolean {
+/**
+ * True when the response is an explicit signature challenge that justifies
+ * one bounded fallback to the other wire profile.
+ */
+export function shouldFallbackToLegacy(response: Response): boolean {
 	if (response.status === 400) return true;
 	if (response.status === 401 || response.status === 403) {
 		const challenge = response.headers.get('www-authenticate') ?? '';
@@ -59,6 +65,7 @@ async function performSignedFetch(
 ): Promise<Response> {
 	const headers: Record<string, string> = {
 		Accept: options.accept ?? 'application/activity+json, application/ld+json; profile="https://www.w3.org/ns/activitystreams"',
+		'User-Agent': `${RELAY_SOFTWARE_NAME}/${RELAY_SOFTWARE_VERSION} (+${config.baseUrl})`,
 	};
 	const signing =
 		profile === 'legacy'
@@ -105,21 +112,6 @@ export async function signedFetch(env: Env, config: RelayConfig, identity: Relay
 		await setCapability(env.DB, origin, options.scope, profile, profile === 'rfc9421' ? CAPABILITY_RFC9421_TTL_SECONDS : CAPABILITY_LEGACY_TTL_SECONDS);
 	}
 	return { response, profile };
-}
-
-/**
- * Plans the concrete wire profile for a delivery before it is queued. The
- * chosen profile never changes across retries.
- */
-export async function planDeliveryProfile(env: Env, config: RelayConfig, inboxUrl: string): Promise<SignatureProfile> {
-	if (config.outboundProfile === 'legacy') return 'legacy';
-	if (config.outboundProfile === 'rfc9421') return 'rfc9421';
-	const origin = normalizeOrigin(inboxUrl);
-	if (origin) {
-		const capability = await getCapability(env.DB, origin, 'delivery');
-		if (capability) return capability;
-	}
-	return 'legacy';
 }
 
 /** Pure delivery-profile selection using preloaded capability evidence. */
@@ -341,11 +333,6 @@ export async function forceRefreshActor(env: Env, config: RelayConfig, identity:
 	if (await env.CACHE.get(throttleKey)) return { actor: null, status: 0 };
 	await env.CACHE.put(throttleKey, '1', { expirationTtl: ACTOR_CACHE_TTL_SECONDS });
 	return resolveRemoteActor(env, config, identity, cleaned, keyId, { forceRefresh: true });
-}
-
-/** Invalidates the cached document for an actor URL. */
-export async function invalidateRemoteActor(env: Env, actorUrl: string): Promise<void> {
-	await env.CACHE.delete(`actor:${stripFragment(actorUrl)}`);
 }
 
 /** Fetches an arbitrary ActivityPub JSON document with a signed GET. */

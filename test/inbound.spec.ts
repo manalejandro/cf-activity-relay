@@ -16,6 +16,9 @@ const PERSON_ACTOR = 'https://remote.example/users/alice';
 const PERSON_KEY = `${PERSON_ACTOR}#main-key`;
 const DELETED_ACTOR = 'https://remote.example/users/deleted';
 const DELETED_KEY = `${DELETED_ACTOR}#main-key`;
+const REFERENCED_ACTIVITY = 'https://other.example/activities/7';
+const OTHER_ACTOR = 'https://other.example/actor';
+const OTHER_KEY = `${OTHER_ACTOR}#main-key`;
 const PUBLIC_ADDRESS = 'https://www.w3.org/ns/activitystreams#Public';
 
 let privateKeyPem = '';
@@ -28,21 +31,36 @@ function stubFederation(): ReturnType<typeof vi.fn> {
 		// A deleted account: its actor document is gone, so its key can never be
 		// resolved. Mastodon still signs the account deletion notice with it.
 		if (url === DELETED_ACTOR) return new Response('gone', { status: 410 });
-		if (url === REMOTE_ACTOR || url === PERSON_ACTOR) {
+		if (url === REMOTE_ACTOR || url === PERSON_ACTOR || url === OTHER_ACTOR) {
 			const isPerson = url === PERSON_ACTOR;
 			return new Response(
 				JSON.stringify({
 					'@context': 'https://www.w3.org/ns/activitystreams',
 					id: url,
 					type: isPerson ? 'Person' : 'Application',
-					inbox: isPerson ? 'https://remote.example/users/alice/inbox' : REMOTE_INBOX,
-					endpoints: { sharedInbox: REMOTE_INBOX },
-					publicKey: { id: isPerson ? PERSON_KEY : REMOTE_KEY, owner: url, publicKeyPem },
+					inbox: isPerson ? 'https://remote.example/users/alice/inbox' : url === OTHER_ACTOR ? 'https://other.example/inbox' : REMOTE_INBOX,
+					endpoints: { sharedInbox: isPerson ? REMOTE_INBOX : url === OTHER_ACTOR ? 'https://other.example/inbox' : REMOTE_INBOX },
+					publicKey: { id: isPerson ? PERSON_KEY : url === OTHER_ACTOR ? OTHER_KEY : REMOTE_KEY, owner: url, publicKeyPem },
 				}),
 				{ headers: { 'Content-Type': 'application/activity+json' } },
 			);
 		}
-		if (url === REMOTE_INBOX || url === 'https://remote.example/users/alice/inbox') return new Response('', { status: 202 });
+		// An unlisted activity: Public only in `cc`.
+		if (url === REFERENCED_ACTIVITY) {
+			return new Response(
+				JSON.stringify({
+					'@context': 'https://www.w3.org/ns/activitystreams',
+					id: REFERENCED_ACTIVITY,
+					type: 'Create',
+					actor: OTHER_ACTOR,
+					to: [`${OTHER_ACTOR}/followers`],
+					cc: [PUBLIC_ADDRESS],
+					object: { id: 'https://other.example/notes/7', type: 'Note' },
+				}),
+				{ headers: { 'Content-Type': 'application/activity+json' } },
+			);
+		}
+		if (url === REMOTE_INBOX || url === 'https://remote.example/users/alice/inbox' || url === 'https://other.example/inbox') return new Response('', { status: 202 });
 		return new Response('not found', { status: 404 });
 	});
 	vi.stubGlobal('fetch', mock);
@@ -347,5 +365,97 @@ describe('inbound inbox processing', () => {
 		expect(announce.type).toBe('Announce');
 		expect(announce.actor).toBe(`${RELAY}/actor`);
 		expect(announce.object).toBe('https://remote.example/notes/2');
+	});
+
+	it('rejects a personal account subscribing with Follow(Public)', async () => {
+		stubFederation();
+		await env.DB.prepare('DELETE FROM subscribers WHERE domain = ?').bind('remote.example').run();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/person-public-follow',
+			type: 'Follow',
+			actor: PERSON_ACTOR,
+			object: PUBLIC_ADDRESS,
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: PERSON_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+		expect(await env.DB.prepare('SELECT 1 AS present FROM subscribers WHERE domain = ?').bind('remote.example').first()).toBeFalsy();
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('not-a-server-actor');
+	});
+
+	it('excludes blocked domains from fan-out', async () => {
+		stubFederation();
+		// Isolate: this test owns the receiver set.
+		await env.DB.prepare('DELETE FROM subscribers').run();
+		await env.DB.prepare(
+			`INSERT INTO subscribers (domain, inbox_url, activity_id, actor_id, created_at) VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(domain) DO NOTHING`,
+		)
+			.bind('blocked.example', 'https://blocked.example/inbox', 'https://blocked.example/activities/follow', 'https://blocked.example/actor', new Date().toISOString())
+			.run();
+		await env.DB.prepare('INSERT INTO blocked_domains (domain, created_at) VALUES (?, ?) ON CONFLICT(domain) DO NOTHING')
+			.bind('blocked.example', new Date().toISOString())
+			.run();
+		try {
+			const body = JSON.stringify({
+				'@context': 'https://www.w3.org/ns/activitystreams',
+				id: 'https://remote.example/activities/create-blocked',
+				type: 'Create',
+				actor: REMOTE_ACTOR,
+				to: [PUBLIC_ADDRESS],
+				object: { id: 'https://remote.example/notes/9', type: 'Note' },
+			});
+			const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+			const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+			expect(response.status).toBe(202);
+			// The only receiver is blocked: nothing may be queued for it.
+			const queued = await env.DB.prepare('SELECT COUNT(*) AS total FROM activity_payloads WHERE body LIKE ?').bind('%notes/9%').first<{ total: number }>();
+			expect(queued?.total).toBe(0);
+		} finally {
+			await env.DB.prepare('DELETE FROM blocked_domains WHERE domain = ?').bind('blocked.example').run();
+			await env.DB.prepare('DELETE FROM subscribers WHERE domain = ?').bind('blocked.example').run();
+		}
+	});
+
+	it('does not amplify a referenced activity that is not public', async () => {
+		stubFederation();
+		await env.DB.prepare(
+			`INSERT INTO subscribers (domain, inbox_url, activity_id, actor_id, created_at) VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(domain) DO NOTHING`,
+		)
+			.bind('remote.example', REMOTE_INBOX, 'https://remote.example/activities/follow-ref', REMOTE_ACTOR, new Date().toISOString())
+			.run();
+		const body = JSON.stringify({
+			'@context': 'https://www.w3.org/ns/activitystreams',
+			id: 'https://remote.example/activities/announce-referenced',
+			type: 'Announce',
+			actor: REMOTE_ACTOR,
+			object: REFERENCED_ACTIVITY,
+			to: [`${RELAY}/actor`],
+		});
+		const signed = await signLegacyRequest({ method: 'POST', url: `${RELAY}/inbox`, body, privateKeyPem, keyId: REMOTE_KEY });
+		const response = await SELF.fetch(`${RELAY}/inbox`, { method: 'POST', headers: signed, body });
+		expect(response.status).toBe(202);
+		const queued = await env.DB.prepare('SELECT COUNT(*) AS total FROM activity_payloads WHERE body LIKE ?').bind('%other.example%').first<{ total: number }>();
+		expect(queued?.total).toBe(0);
+		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
+		expect(entry?.reason).toBe('referenced-not-public');
+		await env.DB.prepare('DELETE FROM subscribers WHERE domain = ?').bind('remote.example').run();
+	});
+
+	it('rejects malformed domain encodings in admin routes', async () => {
+		const testEnv = env as unknown as { ADMIN_TOKEN?: string };
+		testEnv.ADMIN_TOKEN = 'test-token';
+		try {
+			const response = await SELF.fetch(`${RELAY}/admin/domains/%E0%A4%A/block`, {
+				method: 'POST',
+				headers: { Authorization: 'Bearer test-token' },
+			});
+			expect(response.status).toBe(400);
+		} finally {
+			testEnv.ADMIN_TOKEN = undefined;
+		}
 	});
 });

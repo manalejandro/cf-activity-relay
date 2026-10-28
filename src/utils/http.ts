@@ -5,11 +5,22 @@ const JSON_HEADERS = {
 	'X-Content-Type-Options': 'nosniff',
 } as const;
 
-export function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
+export function jsonResponse(body: unknown, init: ResponseInit = {}, contentType: string = JSON_CONTENT_TYPE): Response {
 	const headers = new Headers(init.headers);
-	headers.set('Content-Type', JSON_CONTENT_TYPE);
+	headers.set('Content-Type', contentType);
 	headers.set('X-Content-Type-Options', 'nosniff');
 	return new Response(JSON.stringify(body), { ...init, headers });
+}
+
+/**
+ * Responds with a JSON Resource Descriptor (RFC 7033 §4.2/§10.2). JRDs are
+ * served as `application/jrd+json` without a charset parameter and MUST be
+ * readable from any origin.
+ */
+export function jrdResponse(body: unknown, init: ResponseInit = {}): Response {
+	const headers = new Headers(init.headers);
+	headers.set('Access-Control-Allow-Origin', '*');
+	return jsonResponse(body, { ...init, headers }, 'application/jrd+json');
 }
 
 export function textResponse(body: string, status: number, init: ResponseInit = {}): Response {
@@ -66,17 +77,6 @@ export async function readBodyBounded(request: Request, maxBytes: number): Promi
 		offset += chunk.byteLength;
 	}
 	return new TextDecoder().decode(merged);
-}
-
-/** Reads a bounded amount of a remote response body for diagnostics. */
-export async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
-	try {
-		const text = await response.text();
-		const collapsed = text.replace(/\s+/g, ' ').trim();
-		return collapsed.length > maxBytes ? `${collapsed.slice(0, maxBytes)}[truncated]` : collapsed;
-	} catch {
-		return '';
-	}
 }
 
 /** Reads a response body while enforcing a hard byte limit. */
