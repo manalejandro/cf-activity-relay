@@ -14,6 +14,7 @@ import { sha256Hex } from '../crypto/digest';
 import {
 	addFollower,
 	addSubscriber,
+	bufferPublisher,
 	deleteFollower,
 	deletePending,
 	deleteSubscriber,
@@ -25,23 +26,22 @@ import {
 	listSubscribers,
 	loadRelaySettings,
 	putPending,
-	recordPublisher,
 	recordInbound,
 	releaseCanonical,
 	reserveActivity,
 	reserveCanonical,
 	reserveNonce,
-	setCapability,
 	setPeerStatus,
 	updateFollowerMutual,
 } from '../store/repo';
 import { asStringArray, hostOf, isDeliverableUrl, isEmbeddedObject, normalizeOrigin, objectId } from '../utils/domains';
 import type { APActivity, RelaySettings, RemoteActor } from '../types';
+import type { InboundLogEntry } from '../store/repo';
 import { relayAnnounce, relayFollow, relayReply, relayUndoFollow } from './builders';
 import { enqueueDeliveries, enqueueFanOut, enqueueToFollowers, enqueueToSubscribers } from './fanout';
 import type { RelayIdentity } from './identity';
 import { allowsPublicAddress, excludesPublicOnlyInCc } from './policy';
-import { fetchRemoteActor, fetchRemoteJson, forceRefreshActor, resolveRemoteActor, type ActorResolution } from './remote';
+import { fetchRemoteActor, fetchRemoteJson, forceRefreshActor, rememberCapability, resolveRemoteActor, type ActorResolution } from './remote';
 
 export interface InboundResponse {
 	status: number;
@@ -262,7 +262,7 @@ async function verifyRfc9421(
 		const origin = normalizeOrigin(signerActor.id);
 		if (origin) {
 			try {
-				await setCapability(env.DB, origin, 'delivery', 'rfc9421', CAPABILITY_RFC9421_TTL_SECONDS);
+				await rememberCapability(env, origin, 'delivery', 'rfc9421', CAPABILITY_RFC9421_TTL_SECONDS);
 			} catch (error) {
 				console.warn('unable to record delivery capability', { origin, error: error instanceof Error ? error.message : String(error) });
 			}
@@ -375,7 +375,7 @@ async function recordPublisherActivity(ctx: InboundContext): Promise<{ ok: boole
 	const flags = await getDomainPolicyFlags(ctx.env.DB, domain);
 	if (flags.blocked) return { ok: false, error: `${domain} is blocked` };
 	if (!(await isActorAbleToRelay(ctx, ctx.actor))) return { ok: true };
-	await recordPublisher(ctx.env.DB, {
+	await bufferPublisher(ctx.env.DB, {
 		domain,
 		actorId: ctx.actor.id,
 		inboxUrl: ctx.actor.sharedInbox ?? ctx.actor.inbox ?? null,
@@ -506,7 +506,7 @@ async function executeRelayAddressedAnnounce(ctx: InboundContext): Promise<Inbou
 	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, referencedActor);
 	if (!originActor) return { status: 202, reason: 'origin-actor-unresolved' };
 	if (!(await isActorAbleToRelay(ctx, originActor))) return { status: 202, reason: 'origin-not-relayable' };
-	await recordPublisher(ctx.env.DB, {
+	await bufferPublisher(ctx.env.DB, {
 		domain: originDomain,
 		actorId: originActor.id,
 		inboxUrl: originActor.sharedInbox ?? originActor.inbox ?? null,
@@ -586,7 +586,7 @@ async function executePeerRelayed(ctx: InboundContext): Promise<InboundResponse>
 	const originActor = await fetchRemoteActor(ctx.env, ctx.config, ctx.identity, attribution);
 	if (!originActor) return { status: 202, reason: 'origin-actor-unresolved' };
 	if (!(await isActorAbleToRelay(ctx, originActor))) return { status: 202, reason: 'origin-not-relayable' };
-	await recordPublisher(ctx.env.DB, {
+	await bufferPublisher(ctx.env.DB, {
 		domain: originDomain,
 		actorId: originActor.id,
 		inboxUrl: originActor.sharedInbox ?? originActor.inbox ?? null,
@@ -859,6 +859,20 @@ async function dispatchInbound(ctx: InboundContext): Promise<InboundResponse> {
 	}
 }
 
+/**
+ * The D1 audit trail persists rejections and operationally interesting
+ * outcomes. Plain successes (chained fan-outs, ordinary 202s) are emitted to
+ * Workers Logs only: at firehose volume one INSERT per inbox POST was among
+ * the largest sources of written rows.
+ */
+async function recordInboundEvent(env: Env, entry: InboundLogEntry): Promise<void> {
+	if (entry.status >= 400 || (entry.reason && entry.reason !== 'chained')) {
+		await recordInbound(env.DB, entry);
+		return;
+	}
+	console.log('inbound accepted', { type: entry.type, domain: entry.actorDomain, activityId: entry.activityId, status: entry.status });
+}
+
 /** Verifies and processes an inbound POST to `/inbox`. */
 export async function processInboundActivity(env: Env, config: RelayConfig, identity: RelayIdentity, request: Request, body: string): Promise<InboundResponse> {
 	const url = new URL(request.url);
@@ -902,7 +916,7 @@ export async function processInboundActivity(env: Env, config: RelayConfig, iden
 	}
 
 	const result = await dispatchInbound(verification.ctx);
-	await recordInbound(env.DB, {
+	await recordInboundEvent(env, {
 		at: Math.floor(Date.now() / 1000),
 		type: verification.ctx.activity.type,
 		actorDomain: hostOf(verification.ctx.actor.id),

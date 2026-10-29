@@ -8,7 +8,7 @@
 import { loadConfig, parseDomainList, type RelayConfig } from './config';
 import type { DeliveryMessage, Env } from './env';
 import { consumeDeliveryBatch } from './ap/delivery';
-import { cleanupExpired, ensureStartup } from './store/repo';
+import { cleanupExpired, ensureStartup, flushBuffers } from './store/repo';
 import { handleActor, handleActorCollection } from './routes/actor';
 import { handleAdmin } from './routes/admin';
 import { handleInbox } from './routes/inbox';
@@ -83,6 +83,7 @@ export default {
 
 	async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
 		await ensureStartup(env.DB, parseDomainList(env.BLOCKED_DOMAINS), parseDomainList(env.LIMITED_DOMAINS));
+		await flushBuffers(env.DB, true);
 		await cleanupExpired(env.DB);
 		console.log('scheduled cleanup completed', { cron: controller.cron });
 	},

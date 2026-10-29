@@ -9,13 +9,13 @@ import { DELIVERY_MAX_ATTEMPTS, DELIVERY_RETRY_DELAYS, DELIVERY_TIMEOUT_MS, MAX_
 import { signLegacyRequest } from '../crypto/legacy';
 import { signRfc9421Request } from '../crypto/rfc9421';
 import type { DeliveryMessage, Env } from '../env';
-import { decrementPayload, getPayload, recordReceiverFailure, recordReceiverSuccess, setCapability } from '../store/repo';
+import { bufferReceiverFailure, bufferReceiverSuccess, flushBuffers, getPayload } from '../store/repo';
 import { hostOf, isDeliverableUrl, normalizeOrigin } from '../utils/domains';
 import { discardBody, readTextBounded } from '../utils/http';
 import type { RelayIdentity } from './identity';
 import { getRelayIdentity } from './identity';
 import { CAPABILITY_LEGACY_TTL_SECONDS } from '../config';
-import { shouldFallbackToLegacy } from './remote';
+import { rememberCapability, shouldFallbackToLegacy } from './remote';
 
 function isPermanentStatus(status: number): boolean {
 	if (status >= 300 && status < 400) return true;
@@ -70,7 +70,7 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 			response = await post('legacy');
 			profile = 'legacy';
 			if (response?.ok && origin) {
-				await ignoreFailure(() => setCapability(env.DB, origin, 'delivery', 'legacy', CAPABILITY_LEGACY_TTL_SECONDS));
+				await ignoreFailure(() => rememberCapability(env, origin, 'delivery', 'legacy', CAPABILITY_LEGACY_TTL_SECONDS));
 			}
 		}
 	} catch (error) {
@@ -78,8 +78,7 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 	}
 
 	if (response?.ok) {
-		await ignoreFailure(() => recordReceiverSuccess(env.DB, domain));
-		await decrementPayload(env.DB, task.payloadId);
+		await ignoreFailure(() => bufferReceiverSuccess(env.DB, domain));
 		await discardBody(response);
 		message.ack();
 		console.log('delivery ok', { domain, status: response.status, profile });
@@ -90,8 +89,7 @@ async function deliverOne(env: Env, config: RelayConfig, identity: RelayIdentity
 	const responseText = response ? await readTextBounded(response, MAX_ERROR_BODY_BYTES) : '';
 	const permanent = response !== null && isPermanentStatus(status);
 	if (permanent || message.attempts >= DELIVERY_MAX_ATTEMPTS) {
-		await ignoreFailure(() => recordReceiverFailure(env.DB, domain));
-		await decrementPayload(env.DB, task.payloadId);
+		await ignoreFailure(() => bufferReceiverFailure(env.DB, domain));
 		await discardBody(response);
 		message.ack();
 		console.warn('delivery failed', {
@@ -116,8 +114,7 @@ async function handleDeadLetter(env: Env, message: Message<DeliveryMessage>): Pr
 		message.ack();
 		return;
 	}
-	await ignoreFailure(() => recordReceiverFailure(env.DB, hostOf(task.inboxUrl)));
-	await ignoreFailure(() => decrementPayload(env.DB, task.payloadId));
+	await ignoreFailure(() => bufferReceiverFailure(env.DB, hostOf(task.inboxUrl)));
 	console.warn('delivery dead-lettered', { domain: hostOf(task.inboxUrl) });
 	message.ack();
 }
@@ -134,4 +131,9 @@ export async function consumeDeliveryBatch(batch: MessageBatch<DeliveryMessage>,
 		}
 		await deliverOne(env, config, identity, message);
 	}
+	// Persist aggregated health counters at the end of every batch so the
+	// buffers do not depend solely on the flush interval.
+	await flushBuffers(env.DB).catch((error) => {
+		console.error('aggregate flush failed', { error: error instanceof Error ? error.message : String(error) });
+	});
 }

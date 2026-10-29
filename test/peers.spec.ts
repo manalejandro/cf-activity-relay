@@ -234,6 +234,8 @@ describe('relay-to-relay peering', () => {
 		expect(announce.type).toBe('Announce');
 		expect(announce.actor).toBe(CONFIG.actorId);
 
+		const { flushBuffers } = await import('../src/store/repo');
+		await flushBuffers(env.DB, true);
 		const publisher = await env.DB.prepare('SELECT domain FROM publishers WHERE domain = ?').bind('origin.example').first();
 		expect(publisher).toBeTruthy();
 	});
@@ -340,8 +342,12 @@ describe('relay-to-relay peering', () => {
 			.bind('%notes/flaky%')
 			.first<{ body: string }>();
 		expect(payload).toBeTruthy();
-		const entry = await env.DB.prepare('SELECT reason FROM inbound_log ORDER BY id DESC LIMIT 1').first<{ reason: string }>();
-		expect(entry?.reason).toBe('chained');
+		// Successful chaining is not written to the D1 audit trail (Workers
+		// Logs only): only rejections and operational reasons persist.
+		const logged = await env.DB.prepare('SELECT 1 AS present FROM inbound_log WHERE activity_id = ?')
+			.bind('https://peer.example/activities/announce-flaky')
+			.first();
+		expect(logged).toBeFalsy();
 	}, 15000);
 
 	it('acknowledges without retrying when the referenced object is unfetchable', async () => {

@@ -22,6 +22,29 @@ import type { Env } from '../env';
 import { signLegacyRequest } from '../crypto/legacy';
 import { signRfc9421Request } from '../crypto/rfc9421';
 import { getCapability, setCapability } from '../store/repo';
+
+/**
+ * Capability evidence is per-origin state that rarely changes; rewriting the
+ * same row on every request was a steady source of D1 writes. Writes are
+ * throttled to one per origin/scope/hour unless the profile changes.
+ */
+const capabilityWriteCache = new Map<string, { profile: SignatureProfile; at: number }>();
+const CAPABILITY_WRITE_THROTTLE_MS = 3_600_000;
+
+export async function rememberCapability(
+	env: Env,
+	origin: string,
+	scope: 'fetch' | 'delivery',
+	profile: SignatureProfile,
+	ttlSeconds: number,
+): Promise<void> {
+	const key = `${scope}:${origin}`;
+	const cached = capabilityWriteCache.get(key);
+	const now = Date.now();
+	if (cached && cached.profile === profile && now - cached.at < CAPABILITY_WRITE_THROTTLE_MS) return;
+	await setCapability(env.DB, origin, scope, profile, ttlSeconds);
+	capabilityWriteCache.set(key, { profile, at: now });
+}
 import { hostOf, isPrivateHost, normalizeOrigin, parseHttpUrl, stripFragment } from '../utils/domains';
 import { discardBody, readTextBounded } from '../utils/http';
 import type { RemoteActor } from '../types';
@@ -105,12 +128,12 @@ export async function signedFetch(env: Env, config: RelayConfig, identity: Relay
 		await discardBody(response);
 		response = await performSignedFetch(config, identity, url, 'legacy', options);
 		if (response.ok && origin) {
-			await setCapability(env.DB, origin, 'fetch', 'legacy', CAPABILITY_LEGACY_TTL_SECONDS);
+			await rememberCapability(env, origin, 'fetch', 'legacy', CAPABILITY_LEGACY_TTL_SECONDS);
 		}
 		return { response, profile: 'legacy' };
 	}
 	if (canLearn && response.ok && origin) {
-		await setCapability(env.DB, origin, options.scope, profile, profile === 'rfc9421' ? CAPABILITY_RFC9421_TTL_SECONDS : CAPABILITY_LEGACY_TTL_SECONDS);
+		await rememberCapability(env, origin, options.scope, profile, profile === 'rfc9421' ? CAPABILITY_RFC9421_TTL_SECONDS : CAPABILITY_LEGACY_TTL_SECONDS);
 	}
 	return { response, profile };
 }

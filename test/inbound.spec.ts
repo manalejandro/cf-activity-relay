@@ -308,6 +308,8 @@ describe('inbound inbox processing', () => {
 		expect(announce.to).toEqual([`${RELAY}/actor/followers`]);
 		expect(payload?.body).not.toContain('Tombstone');
 
+		const { flushBuffers } = await import('../src/store/repo');
+		await flushBuffers(env.DB, true);
 		const publisher = await env.DB.prepare('SELECT last_activity_type FROM publishers WHERE domain = ?').bind('remote.example').first<{ last_activity_type: string }>();
 		expect(publisher?.last_activity_type).toBe('Delete');
 	});
@@ -329,6 +331,8 @@ describe('inbound inbox processing', () => {
 
 		// The publisher is accounted for, but the unlisted activity was never
 		// wrapped into a relay Announce payload.
+		const { flushBuffers } = await import('../src/store/repo');
+		await flushBuffers(env.DB, true);
 		const publisher = await env.DB.prepare('SELECT * FROM publishers WHERE domain = ?').bind('remote.example').first();
 		expect(publisher).toBeTruthy();
 		const payload = await env.DB.prepare('SELECT COUNT(*) AS total FROM activity_payloads WHERE body LIKE ?')

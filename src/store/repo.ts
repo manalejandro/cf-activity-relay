@@ -259,6 +259,134 @@ export async function isSubscriberOrFollower(db: D1Database, domain: string): Pr
 }
 
 // ---------------------------------------------------------------------------
+// Buffered aggregates (D1 write reduction)
+// ---------------------------------------------------------------------------
+//
+// Per-delivery and per-activity UPSERTs dominated D1 written rows. Publisher
+// accounting and receiver health are therefore accumulated per isolate and
+// flushed as one batched UPSERT per domain at most once a minute (or on
+// demand: cron, queue batch end, tests). Losing up to a minute of aggregate
+// stats on isolate recycle is acceptable; dedupe and payloads stay
+// synchronous because they carry correctness semantics.
+
+const BUFFER_FLUSH_INTERVAL_MS = 60_000;
+const BUFFER_FLUSH_ENTRIES = 200;
+
+interface PublisherBufferEntry {
+	domain: string;
+	actorId: string;
+	inboxUrl: string | null;
+	activityId: string | null;
+	activityType: string | null;
+	count: number;
+	lastSeen: string;
+}
+
+interface HealthBufferEntry {
+	successes: number;
+	failures: number;
+	lastSuccessAt: string | null;
+	lastFailureAt: string | null;
+}
+
+const publisherBuffer = new Map<string, PublisherBufferEntry>();
+const healthBuffer = new Map<string, HealthBufferEntry>();
+let lastFlushAt = Date.now();
+
+function bufferDue(): boolean {
+	return Date.now() - lastFlushAt > BUFFER_FLUSH_INTERVAL_MS || publisherBuffer.size + healthBuffer.size >= BUFFER_FLUSH_ENTRIES;
+}
+
+export function bufferPublisher(
+	db: D1Database,
+	publisher: { domain: string; actorId: string; inboxUrl: string | null; activityId: string | null; activityType: string | null },
+): Promise<void> {
+	const existing = publisherBuffer.get(publisher.domain);
+	const timestamp = nowIso();
+	if (existing) {
+		existing.actorId = publisher.actorId;
+		existing.inboxUrl = publisher.inboxUrl;
+		existing.activityId = publisher.activityId;
+		existing.activityType = publisher.activityType;
+		existing.count += 1;
+		existing.lastSeen = timestamp;
+	} else {
+		publisherBuffer.set(publisher.domain, { ...publisher, count: 1, lastSeen: timestamp });
+	}
+	return bufferDue() ? flushBuffers(db) : Promise.resolve();
+}
+
+export function bufferReceiverSuccess(db: D1Database, domain: string): Promise<void> {
+	const entry = healthBuffer.get(domain) ?? { successes: 0, failures: 0, lastSuccessAt: null, lastFailureAt: null };
+	entry.successes += 1;
+	entry.lastSuccessAt = nowIso();
+	healthBuffer.set(domain, entry);
+	return bufferDue() ? flushBuffers(db) : Promise.resolve();
+}
+
+export function bufferReceiverFailure(db: D1Database, domain: string): Promise<void> {
+	const entry = healthBuffer.get(domain) ?? { successes: 0, failures: 0, lastSuccessAt: null, lastFailureAt: null };
+	entry.failures += 1;
+	entry.lastFailureAt = nowIso();
+	healthBuffer.set(domain, entry);
+	return bufferDue() ? flushBuffers(db) : Promise.resolve();
+}
+
+/** Flushes the aggregate buffers; `force` ignores the interval threshold. */
+export async function flushBuffers(db: D1Database, force = false): Promise<void> {
+	if (!force && !bufferDue()) return;
+	lastFlushAt = Date.now();
+	const publishers = [...publisherBuffer.values()];
+	const health = [...healthBuffer.entries()];
+	publisherBuffer.clear();
+	healthBuffer.clear();
+	const statements: D1PreparedStatement[] = [];
+	for (const entry of publishers) {
+		statements.push(
+			db
+				.prepare(
+					`INSERT INTO publishers (domain, actor_id, inbox_url, first_seen, last_seen, last_activity_id, last_activity_type, activity_count)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					 ON CONFLICT(domain) DO UPDATE SET
+					   actor_id = excluded.actor_id,
+					   inbox_url = excluded.inbox_url,
+					   last_seen = excluded.last_seen,
+					   last_activity_id = excluded.last_activity_id,
+					   last_activity_type = excluded.last_activity_type,
+					   activity_count = publishers.activity_count + excluded.activity_count`,
+				)
+				.bind(entry.domain, entry.actorId, entry.inboxUrl, entry.lastSeen, entry.lastSeen, entry.activityId, entry.activityType, entry.count),
+		);
+	}
+	for (const [domain, entry] of health) {
+		statements.push(
+			db
+				.prepare(
+					`INSERT INTO receiver_health (domain, last_success_at, last_failure_at, consecutive_failures, total_successes, total_failures)
+					 VALUES (?, ?, ?, ?, ?, ?)
+					 ON CONFLICT(domain) DO UPDATE SET
+					   last_success_at = COALESCE(excluded.last_success_at, receiver_health.last_success_at),
+					   last_failure_at = COALESCE(excluded.last_failure_at, receiver_health.last_failure_at),
+					   consecutive_failures = CASE WHEN excluded.total_successes > 0 THEN 0 ELSE receiver_health.consecutive_failures + excluded.total_failures END,
+					   total_successes = receiver_health.total_successes + excluded.total_successes,
+					   total_failures = receiver_health.total_failures + excluded.total_failures`,
+				)
+				.bind(domain, entry.lastSuccessAt, entry.lastFailureAt, entry.successes > 0 ? 0 : entry.failures, entry.successes, entry.failures),
+		);
+	}
+	if (statements.length === 0) return;
+	// Batches of 100 statements stay within D1 limits; a failed flush is
+	// logged and dropped (aggregate stats, not correctness state).
+	for (let start = 0; start < statements.length; start += 100) {
+		try {
+			await db.batch(statements.slice(start, start + 100));
+		} catch (error) {
+			console.error('aggregate flush failed', { error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Publishers
 // ---------------------------------------------------------------------------
 
@@ -291,27 +419,6 @@ export async function listPublishers(db: D1Database): Promise<Publisher[]> {
 		.prepare('SELECT domain, actor_id, inbox_url, first_seen, last_seen, last_activity_id, last_activity_type, activity_count FROM publishers ORDER BY domain')
 		.all<PublisherRow>();
 	return (rows.results ?? []).map(toPublisher);
-}
-
-export async function recordPublisher(
-	db: D1Database,
-	publisher: { domain: string; actorId: string; inboxUrl: string | null; activityId: string | null; activityType: string | null },
-): Promise<void> {
-	const timestamp = nowIso();
-	await db
-		.prepare(
-			`INSERT INTO publishers (domain, actor_id, inbox_url, first_seen, last_seen, last_activity_id, last_activity_type, activity_count)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-			 ON CONFLICT(domain) DO UPDATE SET
-			   actor_id = excluded.actor_id,
-			   inbox_url = excluded.inbox_url,
-			   last_seen = excluded.last_seen,
-			   last_activity_id = excluded.last_activity_id,
-			   last_activity_type = excluded.last_activity_type,
-			   activity_count = publishers.activity_count + 1`,
-		)
-		.bind(publisher.domain, publisher.actorId, publisher.inboxUrl, timestamp, timestamp, publisher.activityId, publisher.activityType)
-		.run();
 }
 
 // ---------------------------------------------------------------------------
@@ -485,28 +592,6 @@ export async function deletePeer(db: D1Database, domain: string): Promise<void> 
 // Receiver health
 // ---------------------------------------------------------------------------
 
-export async function recordReceiverSuccess(db: D1Database, domain: string): Promise<void> {
-	await db
-		.prepare(
-			`INSERT INTO receiver_health (domain, last_success_at, consecutive_failures, total_successes, total_failures)
-			 VALUES (?, ?, 0, 1, 0)
-			 ON CONFLICT(domain) DO UPDATE SET last_success_at = excluded.last_success_at, consecutive_failures = 0, total_successes = receiver_health.total_successes + 1`,
-		)
-		.bind(domain, nowIso())
-		.run();
-}
-
-export async function recordReceiverFailure(db: D1Database, domain: string): Promise<void> {
-	await db
-		.prepare(
-			`INSERT INTO receiver_health (domain, last_failure_at, consecutive_failures, total_successes, total_failures)
-			 VALUES (?, ?, 1, 0, 1)
-			 ON CONFLICT(domain) DO UPDATE SET last_failure_at = excluded.last_failure_at, consecutive_failures = receiver_health.consecutive_failures + 1, total_failures = receiver_health.total_failures + 1`,
-		)
-		.bind(domain, nowIso())
-		.run();
-}
-
 export async function listReceiverHealth(db: D1Database, domains: string[]): Promise<Map<string, ReceiverHealth>> {
 	const map = new Map<string, ReceiverHealth>();
 	// D1 allows at most 100 bound parameters per query: page the domains.
@@ -554,20 +639,20 @@ export async function getPayload(db: D1Database, id: string): Promise<{ body: st
 	return row ? { body: row.body, remainCount: row.remain_count } : null;
 }
 
-export async function decrementPayload(db: D1Database, id: string): Promise<void> {
-	await db.batch([
-		db.prepare('UPDATE activity_payloads SET remain_count = remain_count - 1 WHERE id = ?').bind(id),
-		db.prepare('DELETE FROM activity_payloads WHERE id = ? AND remain_count <= 0').bind(id),
-	]);
-}
-
+/**
+ * Payloads are released by the TTL cleanup once they age out of the retry
+ * horizon; per-delivery decrements were the largest source of written rows.
+ */
 export async function deletePayload(db: D1Database, id: string): Promise<void> {
 	await db.prepare('DELETE FROM activity_payloads WHERE id = ?').bind(id).run();
 }
 
-/** Number of delivery jobs still outstanding across all shared payloads. */
+/**
+ * Number of shared payloads still within their retention window. Payloads are
+ * released by the TTL cleanup (not per delivery), so stale rows are ignored.
+ */
 export async function countPendingJobs(db: D1Database): Promise<number> {
-	const row = await db.prepare('SELECT COALESCE(SUM(remain_count), 0) AS total FROM activity_payloads').first<{ total: number }>();
+	const row = await db.prepare('SELECT COUNT(*) AS total FROM activity_payloads WHERE created_at > ?').bind(unixNow() - 900).first<{ total: number }>();
 	return row?.total ?? 0;
 }
 
